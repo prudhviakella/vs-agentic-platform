@@ -1,0 +1,38 @@
+[build-system]
+requires      = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name        = "clinical-trial-agent"
+version     = "0.1.0"
+description = "Vidya Sankalp Clinical Trial Agent — pharma-domain AI agent built on vs-agent-core"
+readme      = "README.md"
+requires-python = ">=3.11"
+
+dependencies = [
+    # Core foundation — install from local path during dev, PyPI after publish
+    "vs-agent-core>=0.1.0",
+
+    # LangGraph / LangChain
+    "langgraph>=0.3",
+    "langchain>=0.3",
+    "langchain-openai>=0.2",
+
+    # Evaluation
+    "deepeval>=1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-html>=4.0",
+    "pytest-asyncio>=0.23",
+]
+
+[tool.setuptools.packages.find]
+where   = ["."]
+include = ["agent*"]
+
+[project.urls]
+Homepage   = "https://vidyasankalp.com"
+Repository = "https://github.com/vidyasankalp/clinical-trial-agent"

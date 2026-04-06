@@ -14,7 +14,7 @@ Log fields emitted on every record:
   agent       — injected when known (e.g. "clinical-trial")
 
 Usage:
-  from platform.observability.logger import get_logger
+  from vs_platform.observability.logger import get_logger
   log = get_logger(__name__)
   log.info("Auth passed", extra={"user_id": "abc", "agent": "clinical-trial"})
 """

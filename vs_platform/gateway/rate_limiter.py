@@ -36,7 +36,7 @@ from typing import Dict
 
 from fastapi import HTTPException
 
-from platform.gateway.auth import AuthContext
+from vs_platform.gateway.auth import AuthContext
 
 log = logging.getLogger(__name__)
 

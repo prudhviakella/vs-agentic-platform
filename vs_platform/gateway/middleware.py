@@ -23,7 +23,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import Response
 
-from platform.observability.tracer import RequestContext
+from vs_platform.observability.tracer import RequestContext
 
 log = logging.getLogger(__name__)
 

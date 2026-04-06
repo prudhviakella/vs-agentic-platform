@@ -8,7 +8,7 @@ The request_id is:
   - Passed into agent.invoke() so LangSmith traces are correlated
 
 Usage (in FastAPI middleware):
-  from platform.observability.tracer import RequestContext
+  from vs_platform.observability.tracer import RequestContext
   ctx = RequestContext.from_request(request)
   ctx.bind()          ← injects request_id into log context
   ctx.unbind()        ← cleans up after response

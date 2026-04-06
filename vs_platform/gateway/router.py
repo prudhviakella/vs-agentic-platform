@@ -31,14 +31,14 @@ from typing import Any, Callable
 
 from fastapi import APIRouter, Depends, HTTPException, Path
 
-from platform.gateway.auth import AuthContext, require_auth
-from platform.gateway.injection import check_injection
-from platform.gateway.rate_limiter import check_rate_limit
-from platform.gateway.schemas import (
+from vs_platform.gateway.auth import AuthContext, require_auth
+from vs_platform.gateway.injection import check_injection
+from vs_platform.gateway.rate_limiter import check_rate_limit
+from vs_platform.gateway.schemas import (
     ChatRequest, ChatResponse,
     HITLResumeRequest, ErrorResponse,
 )
-from platform.observability.tracer import get_current_request_id
+from vs_platform.observability.tracer import get_current_request_id
 
 log = logging.getLogger(__name__)
 

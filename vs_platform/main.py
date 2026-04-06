@@ -35,10 +35,10 @@ import os
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from platform.observability.logger import configure_logging
-from platform.gateway.middleware import RequestContextMiddleware, TimingMiddleware
-from platform.gateway.router import router as agent_router
-from platform.prompt_versioning.router import router as prompt_router
+from vs_platform.observability.logger import configure_logging
+from vs_platform.gateway.middleware import RequestContextMiddleware, TimingMiddleware
+from vs_platform.gateway.router import router as agent_router
+from vs_platform.prompt_versioning.router import router as prompt_router
 
 # ── Logging ────────────────────────────────────────────────────────────────────
 configure_logging(level=os.environ.get("LOG_LEVEL", "INFO"))

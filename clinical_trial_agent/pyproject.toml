@@ -10,23 +10,36 @@ readme      = "README.md"
 requires-python = ">=3.11"
 
 dependencies = [
-    # Core foundation — install from local path during dev, PyPI after publish
+    # Core foundation
     "vs-agent-core>=0.1.0",
 
-    # LangGraph / LangChain
-    "langgraph>=0.3",
-    "langchain>=0.3",
-    "langchain-openai>=0.2",
+    # LangChain ecosystem — must match vs-agent-core pins exactly.
+    # Repeated here to prevent pip from upgrading when installing
+    # this package independently of vs-agent-core.
+    "langsmith==0.6.9",
+    "langchain-core==1.2.22",
+    "langchain==1.1.0",
+    "langchain-openai==1.1.1",
+    "langgraph==1.0.4",
+    "langgraph-prebuilt==1.0.7",
+    "langchain-community==0.4.1",
 
-    # Evaluation
-    "deepeval>=1.0",
+    # AWS
+    "boto3",
+
+    # Evaluation + utilities
+    "deepeval",
+    "pydantic",
+    "tenacity",
+    "httpx",
 ]
 
 [project.optional-dependencies]
 dev = [
-    "pytest>=8.0",
-    "pytest-html>=4.0",
-    "pytest-asyncio>=0.23",
+    "pytest",
+    "pytest-asyncio",
+    "pytest-html",
+    "pytest-xdist",
 ]
 
 [tool.setuptools.packages.find]

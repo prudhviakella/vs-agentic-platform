@@ -5,36 +5,22 @@ Centralises all AWS SDK calls so the rest of the codebase has zero boto3
 imports. agent.py, cache.py, and pinecone_store.py stay cloud-agnostic —
 they receive initialised clients, not raw credentials.
 
-WHY a dedicated module (not inline in agent.py):
-  agent.py is assembly code — it wires pillars together.
-  Credential fetching is infrastructure code — it talks to AWS.
-  Mixing them couples the agent lifecycle to AWS SDK behaviour,
-  making it harder to test agent assembly without mocking boto3.
-  With this module, tests mock agent.aws and agent.py stays clean.
+LOCAL DEV MODE (APP_ENV=local):
+  When APP_ENV=local, all credential functions fall back to environment
+  variables / .env.local instead of calling AWS. This lets you develop
+  and test without an AWS account, Cognito, or SSM setup.
 
-WHY SSM for Pinecone, Secrets Manager for Postgres:
-  Pinecone API key → SSM Parameter Store (SecureString, KMS-encrypted).
-    SSM is sufficient for API keys that rotate infrequently and manually.
-    The plaintext never appears in ECS task definitions or CloudTrail logs.
+  Copy .env.local.example to .env.local and fill in your values:
+    PINECONE_API_KEY=pcsk-...
+    PINECONE_INDEX_NAME=clinical-agent
+    OPENAI_API_KEY=sk-...
+    POSTGRES_URL=postgresql://user:pass@localhost:5432/clinical_agent
+    BEDROCK_PROMPT_TEMPLATE=Your prompt template here
 
-  Postgres credentials → Secrets Manager.
-    Secrets Manager supports automatic rotation on a schedule — the RDS
-    secret is rotated every 30 days without manual intervention via the
-    built-in RDS rotation Lambda. SSM has no equivalent native rotation
-    for database credentials. Secrets Manager also tracks GetSecretValue
-    calls in CloudTrail, providing a full access audit trail.
+  Start with:
+    APP_ENV=local python clinical_trial_agent/run.py
 
-WHY lru_cache on clients:
-  boto3.client() opens a new TLS connection each call. lru_cache ensures
-  one client per process — the connection is reused across every credential
-  fetch during the application lifetime.
-
-IAM permissions required (ECS task role / EC2 instance profile):
-  ssm:GetParameter          on arn:aws:ssm:{region}:{account}:parameter/clinical-agent/{env}/*
-  secretsmanager:GetSecretValue on arn:aws:secretsmanager:{region}:{account}:secret:clinical-agent/{env}/*
-  kms:Decrypt               on the KMS key used for SecureString parameters
-
-SSM parameter paths:
+SSM parameter paths (prod/staging/dev):
   /clinical-agent/{env}/pinecone/api_key     ← SecureString
   /clinical-agent/{env}/pinecone/index_name  ← String
 
@@ -52,8 +38,6 @@ import os
 from functools import lru_cache
 from typing import Any
 
-import boto3
-
 log = logging.getLogger(__name__)
 
 
@@ -63,37 +47,51 @@ def get_env() -> str:
     """
     Return the deployment environment name.
 
-    Reads APP_ENV environment variable — the only env var this module uses.
-    Defaults to "prod" so production deployments require no explicit setting.
-    Override with APP_ENV=staging|dev for non-prod environments.
-
-    This is intentionally the only os.environ call in the AWS module — all
-    credentials come from AWS, not from the environment.
+    Values: "local" | "dev" | "staging" | "prod"
+    Defaults to "prod" so production needs no explicit setting.
+    Use APP_ENV=local for local development without AWS.
     """
     return os.environ.get("APP_ENV", "prod")
+
+
+def is_local() -> bool:
+    """Return True when running in local dev mode (APP_ENV=local)."""
+    return get_env() == "local"
+
+
+def _load_dotenv_local() -> None:
+    """
+    Load .env.local if it exists and python-dotenv is installed.
+    Called once at module import time so env vars are available immediately.
+    Silent no-op if the file doesn't exist or dotenv isn't installed.
+    """
+    try:
+        from dotenv import load_dotenv
+        env_file = os.path.join(os.path.dirname(__file__), "..", "..", "..", ".env.local")
+        env_file = os.path.abspath(env_file)
+        if os.path.exists(env_file):
+            load_dotenv(env_file, override=False)
+            log.info(f"[AWS] Loaded .env.local from {env_file}")
+    except ImportError:
+        pass  # python-dotenv not installed — use os.environ directly
+
+
+_load_dotenv_local()
 
 
 # ── Boto3 clients ──────────────────────────────────────────────────────────────
 
 @lru_cache(maxsize=None)
 def _ssm() -> Any:
-    """
-    Return a cached boto3 SSM client.
-
-    lru_cache(maxsize=None) stores one client per process lifetime.
-    Avoids repeated TLS handshakes and session setup on every parameter fetch.
-    The client is constructed lazily on first call, not at import time, so
-    tests that mock boto3.client() can patch before the cache is populated.
-    """
+    """Cached boto3 SSM client. Not used in local mode."""
+    import boto3
     return boto3.client("ssm")
 
 
 @lru_cache(maxsize=None)
 def _secretsmanager() -> Any:
-    """
-    Return a cached boto3 Secrets Manager client.
-    Same lazy-init and caching rationale as _ssm().
-    """
+    """Cached boto3 Secrets Manager client. Not used in local mode."""
+    import boto3
     return boto3.client("secretsmanager")
 
 
@@ -103,70 +101,103 @@ def get_ssm_parameter(name: str, with_decryption: bool = True) -> str:
     """
     Fetch a single AWS SSM Parameter Store value by full path name.
 
+    In local mode (APP_ENV=local): reads from environment variable derived
+    from the SSM path. Example:
+      /clinical-agent/local/pinecone/api_key → PINECONE_API_KEY
+
     Args:
-        name:             Full SSM parameter path, e.g.
-                          "/clinical-agent/prod/pinecone/api_key"
-        with_decryption:  True for SecureString parameters (API keys, tokens).
-                          False for plain String parameters (index names, config).
+        name:             Full SSM parameter path.
+        with_decryption:  True for SecureString parameters.
 
     Returns:
         The parameter value as a plain string.
-
-    Raises:
-        botocore.exceptions.ClientError:
-          ParameterNotFound — path does not exist in SSM.
-          AccessDeniedException — IAM role lacks ssm:GetParameter on this path.
     """
+    if is_local():
+        return _get_local_param(name)
     resp = _ssm().get_parameter(Name=name, WithDecryption=with_decryption)
     return resp["Parameter"]["Value"]
+
+
+def _get_local_param(ssm_path: str) -> str:
+    """
+    Map an SSM path to an environment variable for local dev.
+
+    Mapping rules — last path segment uppercased:
+      .../pinecone/api_key     → PINECONE_API_KEY
+      .../pinecone/index_name  → PINECONE_INDEX_NAME
+      .../bedrock/prompt_id    → BEDROCK_PROMPT_ID
+      .../bedrock/prompt_version → BEDROCK_PROMPT_VERSION
+      .../cognito/user_pool_id → COGNITO_USER_POOL_ID
+      .../cognito/region       → COGNITO_REGION
+      .../platform/api_key     → PLATFORM_API_KEY
+
+    Falls back to the full path converted to env var format if no match.
+    """
+    # Take last two segments: "pinecone/api_key" → "PINECONE_API_KEY"
+    parts  = [p for p in ssm_path.strip("/").split("/") if p]
+    key    = "_".join(parts[-2:]).upper().replace("-", "_")
+    value  = os.environ.get(key)
+    if value:
+        return value
+
+    # Fallback: full path as env var
+    fallback = ssm_path.strip("/").replace("/", "_").replace("-", "_").upper()
+    value = os.environ.get(fallback)
+    if value:
+        return value
+
+    raise EnvironmentError(
+        f"[LOCAL MODE] Missing env var '{key}' for SSM path '{ssm_path}'. "
+        f"Add it to .env.local or export it."
+    )
 
 
 def get_secret_json(secret_name: str) -> dict:
     """
     Fetch an AWS Secrets Manager secret and return it parsed as a dict.
 
-    Handles both SecretString (JSON text) and SecretBinary (base64-encoded
-    JSON bytes) response formats — SecretBinary is used when the secret was
-    created with binary encoding, which some RDS rotation Lambdas produce.
-
-    Args:
-        secret_name: The secret name or ARN, e.g.
-                     "clinical-agent/prod/postgres"
-
-    Returns:
-        Parsed JSON dict of the secret value.
-
-    Raises:
-        botocore.exceptions.ClientError:
-          ResourceNotFoundException — secret does not exist.
-          AccessDeniedException — IAM role lacks secretsmanager:GetSecretValue.
-        json.JSONDecodeError:
-          Secret exists but is not valid JSON — signals a misconfigured secret,
-          not a code bug. The raw value is intentionally not included in the
-          exception message to avoid logging credential fragments.
+    In local mode: reads POSTGRES_URL env var and reconstructs the dict.
     """
+    if is_local():
+        return _get_local_secret(secret_name)
+    import boto3
     resp       = _secretsmanager().get_secret_value(SecretId=secret_name)
     secret_str = resp.get("SecretString") or resp.get("SecretBinary", b"").decode()
     return json.loads(secret_str)
+
+
+def _get_local_secret(secret_name: str) -> dict:
+    """
+    For local dev, read Postgres credentials from POSTGRES_URL env var.
+
+    Format: postgresql://username:password@host:port/dbname
+    """
+    postgres_url = os.environ.get("POSTGRES_URL", "")
+    if postgres_url:
+        # Parse: postgresql://user:pass@host:5432/dbname
+        from urllib.parse import urlparse
+        p = urlparse(postgres_url)
+        return {
+            "host":     p.hostname or "localhost",
+            "port":     str(p.port or 5432),
+            "dbname":   p.path.lstrip("/"),
+            "username": p.username or "",
+            "password": p.password or "",
+        }
+    raise EnvironmentError(
+        f"[LOCAL MODE] Missing POSTGRES_URL for secret '{secret_name}'. "
+        "Add POSTGRES_URL=postgresql://user:pass@host:5432/dbname to .env.local"
+    )
 
 
 # ── High-level resource initialisers ──────────────────────────────────────────
 
 def init_pinecone_index() -> Any:
     """
-    Fetch Pinecone credentials from SSM and return a connected Pinecone Index.
+    Fetch Pinecone credentials and return a connected Pinecone Index.
 
-    SSM parameters fetched:
-      /clinical-agent/{env}/pinecone/api_key     — SecureString (KMS-encrypted)
-      /clinical-agent/{env}/pinecone/index_name  — String
-
-    The Pinecone index must already exist with:
-      metric:    cosine   (required for SemanticCache and PineconeStore)
-      dimension: 1536     (matches text-embedding-3-small output)
-
-    Raises:
-      botocore.exceptions.ClientError — SSM access denied or parameter missing.
-      pinecone.exceptions.PineconeException — index not found or wrong region.
+    Local mode: reads PINECONE_API_KEY + PINECONE_INDEX_NAME from env.
+    AWS mode:   reads from SSM Parameter Store.
     """
     from pinecone import Pinecone
 
@@ -180,33 +211,22 @@ def init_pinecone_index() -> Any:
 
 def init_postgres_url() -> str:
     """
-    Fetch Postgres credentials from Secrets Manager and return a connection URL.
+    Fetch Postgres credentials and return a connection URL.
 
-    Secret name: clinical-agent/{env}/postgres
-    Expected JSON keys: host, port (optional, defaults to 5432),
-                        dbname, username, password
+    Local mode: reads POSTGRES_URL directly from env.
+    AWS mode:   reads from Secrets Manager.
 
-    WHY return a URL string (not a PostgresSaver):
-      The checkpointer setup (PostgresSaver.from_conn_string + .setup()) is the
-      caller's responsibility — it belongs in agent.py where the full agent
-      lifecycle is managed. This function is purely a credential resolver.
-
-    WHY construct the URL here (not store it pre-constructed in Secrets Manager):
-      A pre-constructed URL containing the password stored as a single secret
-      string would expose the password if the string were ever logged. Keeping
-      the password as a separate JSON field means it is never concatenated into
-      any log-safe variable — only into the connection URL string at return time,
-      which is immediately consumed by the caller and never stored.
-
-    Returns:
-        PostgreSQL DSN string: "postgresql://user:password@host:port/dbname"
-        Never log this string.
-
-    Raises:
-      botocore.exceptions.ClientError — Secrets Manager access denied or missing.
-      json.JSONDecodeError — secret is not valid JSON (misconfigured secret).
-      KeyError — required key missing from the secret JSON.
+    Never log the returned string — it contains the password.
     """
+    if is_local():
+        url = os.environ.get("POSTGRES_URL", "")
+        if url:
+            return url
+        raise EnvironmentError(
+            "[LOCAL MODE] Missing POSTGRES_URL. "
+            "Add POSTGRES_URL=postgresql://user:pass@host:5432/dbname to .env.local"
+        )
+
     env    = get_env()
     secret = get_secret_json(f"clinical-agent/{env}/postgres")
 
@@ -217,22 +237,16 @@ def init_postgres_url() -> str:
     password = secret["password"]
 
     log.info(f"[AWS] Postgres  host={host}  db={dbname}  env={env}")
-
-    # Construct DSN at the last possible moment — caller consumes immediately.
-    # Never assign this to a variable that could appear in a log or traceback.
-    return f"postgresql://{username}:{password}@{host}:{port}/{dbname}"
+    from urllib.parse import quote_plus
+    return f"postgresql://{username}:{quote_plus(password)}@{host}:{port}/{dbname}"
 
 
 # ── Bedrock Prompt Management ──────────────────────────────────────────────────
 
 @lru_cache(maxsize=None)
 def _bedrock() -> Any:
-    """
-    Cached boto3 Bedrock Agent Runtime client for prompt retrieval.
-    Uses bedrock-agent-runtime (not bedrock-runtime) — prompt management
-    is part of the Agents API surface, not the core inference surface.
-    IAM: requires bedrock:GetPrompt on the prompt ARN.
-    """
+    """Cached boto3 Bedrock Agent Runtime client."""
+    import boto3
     return boto3.client("bedrock-agent-runtime")
 
 
@@ -240,39 +254,23 @@ def get_bedrock_prompt(prompt_id: str, prompt_version: str = "1") -> str:
     """
     Fetch a prompt template from AWS Bedrock Prompt Management.
 
-    Prompt ID and version are stored in SSM so they can be updated without
-    a code deployment:
-      /clinical-trial-agent/{env}/bedrock/prompt_id
-      /clinical-trial-agent/{env}/bedrock/prompt_version
-
-    The prompt template is stored in Bedrock with named variables:
-      {{domain_frame}}       — injected by the consuming agent's prompt.py
-      {{episodic_context}}   — injected from InMemoryStore / PineconeStore
-      {{max_tool_calls}}     — injected from tools/__init__.py constant
-
-    WHY Bedrock Prompt Management (not hardcoded strings):
-      Prompts are content, not code. Non-engineers (clinical writers, domain
-      experts) can edit, version, and A/B test prompts in the Bedrock console
-      without touching the codebase or triggering a deployment. Version IDs
-      allow instant rollback if a prompt change degrades answer quality.
-
-    Args:
-        prompt_id:      Bedrock prompt resource ID (not ARN).
-        prompt_version: Prompt version string, defaults to "1".
-
-    Returns:
-        The raw prompt template string with {{variable}} placeholders intact.
-        The caller is responsible for substituting variables before sending
-        the prompt to the LLM.
-
-    Raises:
-        botocore.exceptions.ClientError — access denied or prompt not found.
+    Local mode: returns BEDROCK_PROMPT_TEMPLATE env var, or a sensible
+    inline default so the agent can run without Bedrock configured.
     """
-    resp = _bedrock().get_prompt(
-        promptIdentifier=prompt_id,
-        promptVersion=prompt_version,
-    )
-    # Bedrock returns variants — take the first text variant's template content.
+    if is_local():
+        template = os.environ.get("BEDROCK_PROMPT_TEMPLATE", "")
+        if template:
+            return template
+        # Sensible inline default for local development
+        log.warning("[LOCAL MODE] BEDROCK_PROMPT_TEMPLATE not set — using inline default")
+        return (
+            "{{domain_frame}}\n\n"
+            "Always retrieve evidence before answering. Cite your sources. "
+            "Be precise and concise. Maximum {{max_tool_calls}} tool calls per request.\n\n"
+            "{{episodic_context}}"
+        )
+
+    resp     = _bedrock().get_prompt(promptIdentifier=prompt_id, promptVersion=prompt_version)
     variants = resp.get("variants", [])
     if not variants:
         raise ValueError(f"Bedrock prompt '{prompt_id}' v{prompt_version} has no variants")
@@ -286,21 +284,7 @@ def get_bedrock_prompt(prompt_id: str, prompt_version: str = "1") -> str:
 
 
 def get_bedrock_prompt_from_ssm(app_name: str) -> str:
-    """
-    Convenience wrapper — fetches prompt_id and prompt_version from SSM,
-    then calls get_bedrock_prompt().
-
-    SSM parameters:
-      /{app_name}/{env}/bedrock/prompt_id
-      /{app_name}/{env}/bedrock/prompt_version
-
-    Args:
-        app_name: Application name prefix matching the SSM path convention,
-                  e.g. "clinical-trial-agent".
-
-    Returns:
-        Raw prompt template string from Bedrock.
-    """
+    """Fetch prompt_id and prompt_version from SSM then call get_bedrock_prompt()."""
     env            = get_env()
     prompt_id      = get_ssm_parameter(f"/{app_name}/{env}/bedrock/prompt_id",      with_decryption=False)
     prompt_version = get_ssm_parameter(f"/{app_name}/{env}/bedrock/prompt_version",  with_decryption=False)

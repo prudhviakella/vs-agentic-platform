@@ -24,15 +24,15 @@ import logging
 
 from fastapi import APIRouter, Depends, HTTPException, Path
 
-from platform.gateway.auth import AuthContext, require_auth
-from platform.gateway.schemas import (
+from vs_platform.gateway.auth import AuthContext, require_auth
+from vs_platform.gateway.schemas import (
     PromptVersionListResponse,
     PromptActivateRequest,
     PromptActivateResponse,
     PromptVersion,
 )
-from platform.observability.tracer import get_current_request_id
-from platform.prompt_versioning import manager
+from vs_platform.observability.tracer import get_current_request_id
+from vs_platform.prompt_versioning import manager
 
 log = logging.getLogger(__name__)
 

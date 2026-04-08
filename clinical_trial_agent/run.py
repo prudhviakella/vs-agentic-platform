@@ -30,6 +30,16 @@ The interrupt payload structure (identical to notebook 3.3):
 """
 
 import logging
+
+# Configure DEBUG logging for the full vs-agentic-platform package tree.
+# Each module uses logging.getLogger(__name__) — setting the root logger here
+# ensures DEBUG messages from agent/, core/, and middleware/ all flow through.
+# Change to logging.INFO in production to reduce log volume.
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
+    datefmt="%H:%M:%S",
+)
 from typing import Any
 
 from langchain_core.messages import HumanMessage

@@ -62,15 +62,24 @@ class DomainPIIMiddleware(BaseAgentMiddleware):
         messages = state.get("messages", [])
         if not messages:
             return None
+
         last_msg = messages[-1]
         if not (hasattr(last_msg, "type") and last_msg.type == "human"):
             return None
+
         original = str(last_msg.content)
-        cleaned  = self._clean_input(original)
-        if cleaned != original:
-            log.info(f"[DOMAIN_PII] Input redacted  '{original[:40]}' → '{cleaned[:40]}'")
-            last_msg.content = cleaned
-        return None
+        cleaned = self._clean_input(original)
+
+        if cleaned == original:
+            return None  # nothing changed — no state update needed
+
+        log.info(f"[DOMAIN_PII] Input redacted  '{original[:40]}' → '{cleaned[:40]}'")
+        # Create a new message object — don't mutate in place
+        #redacted_msg = last_msg.copy(update={"content": cleaned})  # Pydantic v1
+        redacted_msg = last_msg.model_copy(update={"content": cleaned})  # Pydantic v2
+
+        # Return updated state — replace last message, keep the rest intact
+        return {"messages": messages[:-1] + [redacted_msg]}
 
     @hook_config(can_jump_to=[])
     def after_agent(self, state: AgentState, runtime: Runtime) -> dict[str, Any] | None:
@@ -78,12 +87,22 @@ class DomainPIIMiddleware(BaseAgentMiddleware):
         messages = state.get("messages", [])
         if not messages:
             return None
+
         last_msg = messages[-1]
         if not isinstance(last_msg, AIMessage):
             return None
+
         original = str(last_msg.content)
-        cleaned  = self._redact_email(original)
-        if cleaned != original:
-            log.info(f"[DOMAIN_PII] Output redacted  '{original[:40]}' → '{cleaned[:40]}'")
-            last_msg.content = cleaned
-        return None
+        cleaned = self._redact_email(original)
+
+        if cleaned == original:
+            return None  # nothing changed — no state update needed
+
+        log.info(f"[DOMAIN_PII] Output redacted  '{original[:40]}' → '{cleaned[:40]}'")
+
+        #New message object — don't mutate in place
+        redacted_msg = last_msg.copy(update={"content": cleaned})  # Pydantic v1
+        # redacted_msg = last_msg.model_copy(update={"content": cleaned})  # Pydantic v2
+
+        # Return updated state
+        return {"messages": messages[:-1] + [redacted_msg]}

@@ -83,12 +83,12 @@ class SemanticCacheMiddleware(BaseAgentMiddleware):
         user_content = str(last_msg.content).strip()
         if not user_content:
             return None
-
+        user_id = runtime.context.user_id
         run_id = self._get_run_id(runtime)
         self._last_question[run_id] = user_content
 
         try:
-            cached = self._cache.lookup(user_content)
+            cached = self._cache.lookup(user_content,user_id)
             if cached:
                 log.info("[CACHE_MIDDLEWARE] HIT — returning cached answer, skipping all work")
                 return {"messages": [AIMessage(content=cached)], "jump_to": "end"}
@@ -108,6 +108,7 @@ class SemanticCacheMiddleware(BaseAgentMiddleware):
         pop() on _last_question cleans up the bridge entry in one operation,
         preventing unbounded growth in long-running processes.
         """
+        user_id = runtime.context.user_id
         run_id   = self._get_run_id(runtime)
         question = self._last_question.pop(run_id, "")
         if not question:
@@ -122,13 +123,13 @@ class SemanticCacheMiddleware(BaseAgentMiddleware):
         if question and answer:
             threading.Thread(
                 target=self._store_sync,
-                args=(question, answer),
+                args=(question, answer, user_id),
                 daemon=True,
             ).start()
 
         return None
 
-    def _store_sync(self, question: str, answer: str, ttl: int = 3_600) -> None:
+    def _store_sync(self, question: str, answer: str, user_id:str, ttl: int = 3_600) -> None:
         """
         Background write — called from daemon thread in after_agent.
 
@@ -138,6 +139,6 @@ class SemanticCacheMiddleware(BaseAgentMiddleware):
         results or guideline revisions.
         """
         try:
-            self._cache.store(question, answer, ttl=ttl)
+            self._cache.store(question, answer, user_id,ttl=ttl)
         except Exception as exc:
             log.warning(f"[CACHE_MIDDLEWARE] Store failed: {exc}")

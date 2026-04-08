@@ -34,6 +34,16 @@ WHY build_agent() is a factory function (not a module-level singleton):
   Test isolation: every test fixture gets a fresh agent with empty state.
   Multi-domain: pharma and general agents share no state.
 
+WHY use_postgres=False is the default for run.py / tests:
+  PostgresSaver writes checkpoints to Postgres and persists them across
+  process restarts — correct for the production API server where HITL
+  pause/resume must survive a deploy or pod restart.
+  But run.py is a demo script. Re-running it with the same hardcoded
+  thread_ids would append new messages on top of old checkpoints, causing
+  stale tool_call_id errors after the second run.
+  MemorySaver keeps checkpoints in-process RAM — wiped when the script
+  exits. Each run_examples() call starts from a clean slate.
+
 WHY two separate LLM instances:
   create_agent uses "gpt-4o" for main reasoning.
   OutputGuardrailMiddleware uses "gpt-4o-mini" at temperature=0 —
@@ -55,6 +65,7 @@ from typing import Any
 
 from langchain.agents import create_agent
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from langgraph.checkpoint.memory import MemorySaver
 from langgraph.checkpoint.postgres import PostgresSaver
 
 from core import aws
@@ -67,24 +78,27 @@ from agent.tools import ALL_TOOLS
 log = logging.getLogger(__name__)
 
 
-def build_agent(domain: str = "general") -> Any:
+def build_agent(domain: str = "general", use_postgres: bool = False) -> Any:
     """
     Assemble and return a compiled LangChain agent with all pillars wired together.
 
     Fetches all credentials at call time via core.aws — no credentials live here.
 
     Args:
-        domain: "pharma" | "general"
-                Controls SemanticCache threshold and system prompt framing.
+        domain:       "pharma" | "general"
+                      Controls SemanticCache threshold and system prompt framing.
+        use_postgres: True  → PostgresSaver (durable, survives restarts) — for production API.
+                      False → MemorySaver   (in-process RAM, wiped on exit) — for run.py / tests.
 
     Returns:
-        Compiled LangChain agent ready for invoke() in run.py.
+        Compiled LangChain agent ready for invoke() in run.py or the FastAPI gateway.
 
     Raises:
         botocore.exceptions.ClientError  — SSM or Secrets Manager access denied.
         EnvironmentError                 — required SSM parameter missing.
         pinecone.exceptions.PineconeException — Pinecone index not found.
-        psycopg.OperationalError         — Postgres unreachable or wrong credentials.
+        psycopg.OperationalError         — Postgres unreachable or wrong credentials
+                                           (only when use_postgres=True).
     """
     # Shared embedder — one instance reuses the HTTP connection pool across
     # both PineconeStore and SemanticCache.
@@ -105,15 +119,27 @@ def build_agent(domain: str = "general") -> Any:
         namespace=f"cache_{domain}",
     )
 
-    # PostgresSaver — durable HITL checkpointer.
-    # from_conn_string() returns a context manager in langgraph-checkpoint-postgres>=3.x.
-    # Use the connection string directly with psycopg instead.
-    # setup() creates checkpoint tables on first run (idempotent thereafter).
-    import psycopg
-    conn_string  = aws.init_postgres_url()
-    conn         = psycopg.connect(conn_string, autocommit=True)
-    checkpointer = PostgresSaver(conn)
-    checkpointer.setup()
+    # Checkpointer — two modes:
+    #
+    # PostgresSaver (use_postgres=True):
+    #   Durable — survives process restarts. Required for production HITL
+    #   where a pod restart must not lose a paused conversation mid-interrupt.
+    #   setup() creates the checkpoint tables once (idempotent thereafter).
+    #
+    # MemorySaver (use_postgres=False, default):
+    #   In-process RAM — wiped when the script exits. Use for run.py demos
+    #   and tests. Prevents stale tool_call_id errors caused by old checkpoints
+    #   accumulating in Postgres across repeated script runs.
+    if use_postgres:
+        import psycopg
+        conn_string  = aws.init_postgres_url()
+        conn         = psycopg.connect(conn_string, autocommit=True)
+        checkpointer = PostgresSaver(conn)
+        checkpointer.setup()
+        checkpointer_label = "postgres"
+    else:
+        checkpointer = MemorySaver()
+        checkpointer_label = "memory"
 
     safety_llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
 
@@ -142,6 +168,6 @@ def build_agent(domain: str = "general") -> Any:
         f"  tools={[t.name for t in ALL_TOOLS]}"
         f"  middleware={len(middleware_stack)}"
         f"  store=pinecone  cache=pinecone(cache_{domain})"
-        f"  checkpointer=postgres"
+        f"  checkpointer={checkpointer_label}"
     )
     return agent

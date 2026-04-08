@@ -144,7 +144,30 @@ def run_examples():
     3. Cache HIT             — same question again, skips all work
     4. PII in input          — PIIMiddleware redacts before LLM sees it
     5. Multi-turn            — episodic memory enriches second turn
+
+    Thread-ID design
+    ─────────────────
+    thread_id = one conversation window. Same thread_id across turns = same
+    conversation; LangGraph loads the checkpoint and appends. Different
+    thread_id = different window, fresh checkpoint.
+
+    Examples 1–4 each test an independent scenario and must NOT share
+    message history — hence different thread_ids.
+
+    Example 5 uses the SAME thread_id for both turns intentionally — that IS
+    the multi-turn test. Turn 2's "the medication we just discussed" resolves
+    only because LangGraph loads turn 1's checkpoint for the same thread.
+
+    Why MemorySaver here (use_postgres=False, the default):
+    The production FastAPI gateway calls build_agent(use_postgres=True) so HITL
+    checkpoints survive pod restarts. run.py is a demo script — MemorySaver
+    keeps checkpoints in process RAM and wipes them on exit. Re-running the
+    script always starts clean, avoiding stale tool_call_id errors caused by
+    old checkpoints accumulating in Postgres across repeated runs.
     """
+    # use_postgres=False (default) → MemorySaver: checkpoints live in RAM,
+    # wiped when this script exits. Safe to re-run without clearing Postgres.
+    # In production, the gateway calls build_agent(use_postgres=True).
     agent = build_agent(domain="pharma")
 
     base_context: AgentContext = {
@@ -178,6 +201,9 @@ def run_examples():
     print(result["messages"][-1].content)
 
     # ── Example 3: Cache HIT ───────────────────────────────────────────────
+    # Different thread from Example 1 — cache hit is SEMANTIC (Pinecone similarity),
+    # not checkpoint-based. SemanticCacheMiddleware fires before the LLM regardless
+    # of thread_id, as long as the question embedding is similar enough.
     print("\n" + "═" * 70)
     print("EXAMPLE 3 — Same question again (should be CACHE HIT)")
     print("═" * 70)
@@ -202,6 +228,10 @@ def run_examples():
     print(result["messages"][-1].content)
 
     # ── Example 5: Multi-turn ─────────────────────────────────────────────
+    # Both turns share the SAME thread_id — intentional. LangGraph loads
+    # turn 1's checkpoint when turn 2 arrives, so "the medication we just
+    # discussed" resolves correctly. EpisodicMemoryMiddleware also surfaces
+    # the turn-1 Q&A pair to enrich the system prompt for turn 2.
     print("\n" + "═" * 70)
     print("EXAMPLE 5 — Multi-turn (episodic memory enriches second turn)")
     print("═" * 70)
@@ -210,7 +240,7 @@ def run_examples():
         "session_id": "demo_session_005",
         "domain":     "pharma",
     }
-    mt_config = {"configurable": {"thread_id": "demo_session_005"}}
+    mt_config = {"configurable": {"thread_id": "demo_session_005"}}   # shared across both turns
 
     invoke_with_hitl(
         agent,

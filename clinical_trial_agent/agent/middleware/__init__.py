@@ -24,6 +24,7 @@ Stack:
 from langchain.agents.middleware import HumanInTheLoopMiddleware, SummarizationMiddleware
 
 # Domain-agnostic middleware from vs-agent-core
+from core.aws import get_trace_table_name
 from core.middleware.tracer import TracerMiddleware
 from core.middleware.semantic_cache import SemanticCacheMiddleware
 from core.middleware.episodic_memory import EpisodicMemoryMiddleware
@@ -50,7 +51,7 @@ def build_stack(domain: str, store, safety_llm, cache: SemanticCache) -> list:
         Ordered list of middleware instances ready for create_agent(middleware=...).
     """
     return [
-        TracerMiddleware(),
+        TracerMiddleware(dynamodb_table_name=get_trace_table_name()),
         DomainPIIMiddleware(),
         ContentFilterMiddleware(),
         SemanticCacheMiddleware(cache=cache),

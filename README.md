@@ -154,7 +154,37 @@ rm /tmp/pg_secret.json
 
 LangGraph checkpoint tables are created automatically on first run.
 
-### 4. SSM Parameters
+### 4. DynamoDB Trace Table
+
+The DynamoDB table for agent trace persistence is **created automatically** on the
+first request — no manual table creation needed. You only need to register the
+table name in SSM (step 5 below) so the platform knows what to create.
+
+The table is provisioned with:
+- **Billing:** PAY_PER_REQUEST — no capacity planning needed
+- **TTL:** `expires_at` attribute — traces auto-deleted after 30 days (free)
+- **PK:** `run_id` (String) — unique per agent request
+
+IAM role running the platform must have these DynamoDB permissions:
+
+```json
+{
+  "Effect": "Allow",
+  "Action": [
+    "dynamodb:CreateTable",
+    "dynamodb:DescribeTable",
+    "dynamodb:PutItem",
+    "dynamodb:GetItem",
+    "dynamodb:UpdateTimeToLive"
+  ],
+  "Resource": "arn:aws:dynamodb:us-east-1:*:table/clinical-agent-traces"
+}
+```
+
+> **Local dev:** Set `TRACE_TABLE_NAME=clinical-agent-traces` in `.env.local`
+> (or omit it — the platform defaults to `clinical-agent-traces` locally).
+
+### 5. SSM Parameters
 
 Generate a platform API key first:
 ```bash
@@ -177,6 +207,10 @@ aws ssm put-parameter --name /clinical-agent/dev/bedrock/prompt_id \
 
 aws ssm put-parameter --name /clinical-agent/dev/bedrock/prompt_version \
     --value "1" --type String
+
+# DynamoDB trace table (table is auto-created on first request)
+aws ssm put-parameter --name /clinical-agent/dev/dynamodb/trace_table_name \
+    --value "clinical-agent-traces" --type String
 
 # Platform API key
 aws ssm put-parameter --name /clinical-agent/dev/platform/api_key \
@@ -223,6 +257,12 @@ in step 2 and bump the SSM version.
 **Shell quoting errors (`dquote>` prompt) when passing JSON to AWS CLI**
 Always write JSON to a file and pass `file:///tmp/filename.json` to `--cli-input-json`
 or `--secret-string`. Never pass complex JSON inline on the command line.
+
+**DynamoDB traces not appearing after first request**
+DynamoDB TTL deletes are eventually consistent — items are removed within 48 h of
+`expires_at`, not instantly. If traces are missing immediately after the first request,
+check CloudWatch logs for `[AWS] Trace persisted` or `[TRACER] Background DynamoDB write failed`.
+The background write is fire-and-forget; errors are logged but never bubble up to the API response.
 
 ---
 

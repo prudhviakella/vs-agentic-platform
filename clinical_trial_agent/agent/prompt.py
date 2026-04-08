@@ -60,10 +60,22 @@ def _get_template() -> str:
 
     SSM is read on every call (not cached) so version updates in SSM take
     effect immediately without a process restart.
+
+    Local mode (APP_ENV=local): skips SSM entirely and delegates directly to
+    aws.get_bedrock_prompt() which returns _LOCAL_SYSTEM_PROMPT — the full
+    production-equivalent prompt including the MANDATORY CLARIFICATION RULE.
+    This avoids the EnvironmentError that would otherwise be thrown for missing
+    BEDROCK_PROMPT_ID, which would silently activate the thin emergency fallback
+    inside context_aware_prompt and break HITL.
     """
+    if aws.is_local():
+        # "local" / "0" are sentinel values — get_bedrock_prompt() returns
+        # _LOCAL_SYSTEM_PROMPT immediately without calling Bedrock or SSM.
+        return _fetch_prompt_template("local", "0")
+
     env            = aws.get_env()
-    prompt_id      = aws.get_ssm_parameter(f"/{_APP_NAME}/{env}/bedrock/prompt_id",     with_decryption=False)
-    prompt_version = aws.get_ssm_parameter(f"/{_APP_NAME}/{env}/bedrock/prompt_version", with_decryption=False)
+    prompt_id      = aws.get_ssm_parameter(f"/{_APP_NAME}/{env}/bedrock/prompt_id",      with_decryption=False)
+    prompt_version = aws.get_ssm_parameter(f"/{_APP_NAME}/{env}/bedrock/prompt_version",  with_decryption=False)
     return _fetch_prompt_template(prompt_id, prompt_version)
 
 
@@ -146,11 +158,28 @@ def context_aware_prompt(request: Any) -> str:
     try:
         template = _get_template()
     except Exception as exc:
-        log.error(f"[PROMPT] Bedrock fetch failed ({exc}) — using fallback prompt")
+        log.error(f"[PROMPT] Bedrock fetch failed ({exc}) — using emergency fallback prompt")
+        # Emergency fallback — Bedrock unreachable (network, permissions, etc.)
+        # MUST include the MANDATORY CLARIFICATION RULE. Without it the LLM
+        # asks clarifying questions in plain text, HumanInTheLoopMiddleware
+        # never sees a tool call, and HITL is silently broken.
+        # This mirrors _LOCAL_SYSTEM_PROMPT in core/aws.py — keep in sync.
         template = (
             "{{domain_frame}}\n\n"
-            "Always retrieve evidence before answering. Cite sources. "
-            "Maximum {{max_tool_calls}} tool calls per request.\n"
+            "You are an expert clinical research assistant with deep knowledge of "
+            "pharmaceutical drug development, clinical trial design, regulatory "
+            "frameworks (FDA, EMA, ICH), and evidence-based medicine.\n\n"
+            "CORE BEHAVIOUR:\n"
+            "- Always retrieve evidence before answering. Never answer from memory alone.\n"
+            "- Cite the specific source, trial name, or document for every clinical claim.\n"
+            "- Be precise with numbers — dosages, p-values, endpoints, sample sizes matter.\n\n"
+            "CLARIFICATION RULE — MANDATORY:\n"
+            "When the request is ambiguous, you MUST call the ask_user_input tool.\n"
+            "Do NOT ask clarifying questions in plain text — ALWAYS use the tool.\n"
+            "Failing to call the tool means the user cannot respond interactively.\n"
+            "Use ask_user_input when: the trial name or drug is ambiguous, the question\n"
+            "could refer to multiple phases or indications, or the user intent is unclear.\n\n"
+            "TOOL USAGE: Maximum {{max_tool_calls}} tool calls per request.\n\n"
             "{{episodic_context}}"
         )
 

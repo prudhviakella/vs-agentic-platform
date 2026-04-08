@@ -35,6 +35,7 @@ Secrets Manager secret:
 import json
 import logging
 import os
+import time
 from functools import lru_cache
 from typing import Any
 
@@ -51,7 +52,7 @@ def get_env() -> str:
     Defaults to "prod" so production needs no explicit setting.
     Use APP_ENV=local for local development without AWS.
     """
-    return os.environ.get("APP_ENV", "prod")
+    return os.environ.get("APP_ENV", "dev")
 
 
 def is_local() -> bool:
@@ -209,6 +210,26 @@ def init_pinecone_index() -> Any:
     return Pinecone(api_key=api_key).Index(index_name)
 
 
+def get_trace_table_name(app_name: str = "clinical-agent") -> str:
+    """
+    Fetch the DynamoDB trace table name from SSM Parameter Store.
+
+    SSM path: /{app_name}/{env}/dynamodb/trace_table_name
+    Local fallback env var: TRACE_TABLE_NAME
+    Local default (if env var also missing): "{app_name}-traces"
+
+    Follows the same pattern as every other config value in this module —
+    callers never hardcode table names; they always come from SSM.
+    """
+    if is_local():
+        return os.environ.get("TRACE_TABLE_NAME", f"{app_name}-traces")
+    env = get_env()
+    return get_ssm_parameter(
+        f"/{app_name}/{env}/dynamodb/trace_table_name",
+        with_decryption=False,
+    )
+
+
 def init_postgres_url() -> str:
     """
     Fetch Postgres credentials and return a connection URL.
@@ -250,25 +271,80 @@ def _bedrock() -> Any:
     return boto3.client("bedrock-agent-runtime")
 
 
+# ── LOCAL DEFAULT SYSTEM PROMPT ────────────────────────────────────────────────
+# This is the single source of truth for local dev.
+# MUST be kept in sync with the Bedrock prompt in AWS (README § Bedrock Setup).
+#
+# THE MANDATORY CLARIFICATION RULE IS NON-NEGOTIABLE.
+# Without it, the LLM asks clarifying questions in plain text instead of
+# calling ask_user_input. HumanInTheLoopMiddleware never sees a tool call,
+# the graph never interrupts, and HITL is silently broken.
+# Every time you update the Bedrock prompt in AWS, update this constant too.
+# ──────────────────────────────────────────────────────────────────────────────
+_LOCAL_SYSTEM_PROMPT = """\
+{domain_frame}
+
+You are an expert clinical research assistant with deep knowledge of \
+pharmaceutical drug development, clinical trial design, regulatory \
+frameworks (FDA, EMA, ICH), and evidence-based medicine.
+
+CORE BEHAVIOUR:
+- Always retrieve evidence before answering. Never answer from memory alone.
+- Cite the specific source, trial name, or document for every clinical claim.
+- If the retrieved evidence is insufficient, say so explicitly.
+- Be precise with numbers — dosages, p-values, endpoints, sample sizes matter.
+
+CLARIFICATION RULE — MANDATORY:
+When the request is ambiguous, you MUST call the ask_user_input tool.
+Do NOT ask clarifying questions in plain text — ALWAYS use the tool.
+Failing to call the tool means the user cannot respond interactively.
+Use ask_user_input when:
+- The trial name or drug is ambiguous
+- The question could refer to multiple phases or indications
+- The user intent is unclear
+
+DISCLAIMERS:
+- Always include: This information is for research purposes only and does not constitute medical advice.
+- Never recommend specific treatments for individual patients.
+- Flag if data is preliminary, unpublished, or from a single study.
+
+TOOL USAGE:
+- Maximum {max_tool_calls} tool calls per request.
+- Use search for recent trials and regulatory decisions.
+- Use graph for relationships between drugs, targets, and indications.
+- Use summariser for long documents.
+- Use chart only when visualising data adds clarity.
+
+{episodic_context}\
+"""
+
+
 def get_bedrock_prompt(prompt_id: str, prompt_version: str = "1") -> str:
     """
     Fetch a prompt template from AWS Bedrock Prompt Management.
 
-    Local mode: returns BEDROCK_PROMPT_TEMPLATE env var, or a sensible
-    inline default so the agent can run without Bedrock configured.
+    Local mode: returns BEDROCK_PROMPT_TEMPLATE env var if set (useful for
+    testing prompt changes without AWS), otherwise falls back to
+    _LOCAL_SYSTEM_PROMPT which mirrors the production Bedrock prompt exactly.
+
+    AWS mode: fetches the versioned prompt from Bedrock Prompt Management.
+    The returned template uses {{double_braces}} for LangChain variables
+    (domain_frame, episodic_context, max_tool_calls).
     """
-    if is_local():
+    # Local mode OR sentinel values from prompt.py's local short-circuit.
+    # prompt.py calls _fetch_prompt_template("local", "0") to skip SSM —
+    # both branches must return _LOCAL_SYSTEM_PROMPT (or BEDROCK_PROMPT_TEMPLATE
+    # if the developer set it for manual prompt testing).
+    if is_local() or prompt_id == "local":
         template = os.environ.get("BEDROCK_PROMPT_TEMPLATE", "")
         if template:
+            log.info("[LOCAL MODE] Using BEDROCK_PROMPT_TEMPLATE from env")
             return template
-        # Sensible inline default for local development
-        log.warning("[LOCAL MODE] BEDROCK_PROMPT_TEMPLATE not set — using inline default")
-        return (
-            "{{domain_frame}}\n\n"
-            "Always retrieve evidence before answering. Cite your sources. "
-            "Be precise and concise. Maximum {{max_tool_calls}} tool calls per request.\n\n"
-            "{{episodic_context}}"
+        log.warning(
+            "[LOCAL MODE] BEDROCK_PROMPT_TEMPLATE not set — "
+            "using _LOCAL_SYSTEM_PROMPT (mirrors Bedrock prod prompt)"
         )
+        return _LOCAL_SYSTEM_PROMPT
 
     resp     = _bedrock().get_prompt(promptIdentifier=prompt_id, promptVersion=prompt_version)
     variants = resp.get("variants", [])
@@ -289,3 +365,191 @@ def get_bedrock_prompt_from_ssm(app_name: str) -> str:
     prompt_id      = get_ssm_parameter(f"/{app_name}/{env}/bedrock/prompt_id",      with_decryption=False)
     prompt_version = get_ssm_parameter(f"/{app_name}/{env}/bedrock/prompt_version",  with_decryption=False)
     return get_bedrock_prompt(prompt_id, prompt_version)
+
+
+# ── DynamoDB — Trace Persistence ───────────────────────────────────────────────
+#
+# DynamoDB is the right store for agent traces:
+#   • Write-once, read-by-run-id  → simple PK lookup, no joins needed
+#   • Schema-flexible             → trace dict maps directly to a DynamoDB item
+#   • TTL built-in                → auto-expire old traces at zero cost
+#
+# Follows the same pattern as _ssm() / _secretsmanager() / _bedrock() above:
+# the boto3 resource is cached here; callers (TracerMiddleware) have zero boto3.
+
+@lru_cache(maxsize=None)
+def _dynamodb(region: str = "us-east-1") -> Any:
+    """
+    Cached boto3 DynamoDB *resource* (high-level API).
+
+    We use resource (not client) so table operations like
+    table.put_item() and table.get_item() are object-oriented and
+    don't require manually constructing AttributeValue dicts.
+
+    lru_cache key includes region so multi-region deployments work correctly.
+    """
+    import boto3
+    return boto3.resource("dynamodb", region_name=region)
+
+
+def init_trace_table(
+    table_name: str,
+    ttl_days:   int = 30,
+    region:     str = "us-east-1",
+) -> Any:
+    """
+    Return a DynamoDB Table resource, creating the table if it does not exist.
+
+    This function is designed to be called once at startup (or lazily on first
+    write). Subsequent calls return the existing table immediately via
+    load() — DescribeTable costs ~1 ms and is called at most once per process.
+
+    Table design
+    ─────────────
+    PK  run_id     (S)  — unique per agent request (LangGraph run_id)
+        ts         (N)  — Unix epoch float, for sorting in the DynamoDB console
+        expires_at (N)  — Unix epoch int, TTL attribute; DynamoDB auto-deletes
+                          items within 48 h of this timestamp
+        + all trace fields (question, answer, tools_called, elapsed_ms, …)
+
+    No GSI by default. Add a GSI on (agent, ts) only when you have a real
+    query pattern that needs it — GSIs cost money even when idle.
+
+    BillingMode=PAY_PER_REQUEST: no capacity planning needed for trace volumes.
+    Switch to PROVISIONED only if you have steady, high-volume load.
+
+    Args:
+        table_name: DynamoDB table name to create or confirm.
+        ttl_days:   Days before a trace item is auto-expired. 0 = no TTL.
+        region:     AWS region for the DynamoDB resource.
+
+    Returns:
+        boto3 DynamoDB Table resource, confirmed ACTIVE.
+    """
+    from botocore.exceptions import ClientError
+
+    ddb   = _dynamodb(region)
+    table = ddb.Table(table_name)
+
+    try:
+        # load() = DescribeTable. Cheap — confirms table exists and is ACTIVE.
+        table.load()
+        log.info(f"[AWS] DynamoDB table '{table_name}' found  region={region}")
+
+    except ClientError as e:
+        if e.response["Error"]["Code"] != "ResourceNotFoundException":
+            raise  # Unexpected error (permissions, network) — surface it
+
+        # Table doesn't exist → create it now.
+        log.info(f"[AWS] DynamoDB table '{table_name}' not found — creating…")
+        table = ddb.create_table(
+            TableName=table_name,
+            KeySchema=[
+                {"AttributeName": "run_id", "KeyType": "HASH"},
+            ],
+            AttributeDefinitions=[
+                {"AttributeName": "run_id", "AttributeType": "S"},
+            ],
+            BillingMode="PAY_PER_REQUEST",
+        )
+        # Block until ACTIVE — create_table is async; wait_until_exists polls.
+        table.wait_until_exists()
+
+        if ttl_days > 0:
+            # TTL deletes happen automatically within 48 h of expires_at.
+            # There is no extra charge for TTL deletions.
+            ddb.meta.client.update_time_to_live(
+                TableName=table_name,
+                TimeToLiveSpecification={
+                    "Enabled":       True,
+                    "AttributeName": "expires_at",
+                },
+            )
+            log.info(
+                f"[AWS] TTL enabled on '{table_name}'.expires_at "
+                f"(auto-expire after {ttl_days} days)"
+            )
+
+        log.info(f"[AWS] DynamoDB table '{table_name}' created and ACTIVE")
+
+    return table
+
+
+def put_trace(table: Any, trace: dict, ttl_days: int = 30) -> None:
+    """
+    Serialize a trace dict and write it to DynamoDB.
+
+    Serialization rules
+    ─────────────────────
+    • float  → Decimal  DynamoDB rejects Python float; Decimal is required.
+    • None   → omitted  DynamoDB rejects null attribute values by default.
+    • list/dict fields (tool_results, tools_called) are stored as L / M types
+      automatically by the boto3 resource layer — no manual AttributeValue needed.
+
+    Args:
+        table:    boto3 DynamoDB Table resource (from init_trace_table).
+        trace:    Trace dict produced by TracerMiddleware._extract_from_state.
+        ttl_days: Days until the item is auto-expired. 0 = no TTL attribute written.
+
+    Raises:
+        Nothing — all exceptions are caught and logged.
+        Observability must never break the agent response path.
+    """
+    from decimal import Decimal
+
+    def _to_decimal(v: Any) -> Any:
+        """Recursively convert float → Decimal inside nested dicts/lists."""
+        if isinstance(v, float):
+            return Decimal(str(round(v, 4)))
+        if isinstance(v, dict):
+            return {k: _to_decimal(val) for k, val in v.items()}
+        if isinstance(v, list):
+            return [_to_decimal(i) for i in v]
+        return v
+
+    try:
+        item = _to_decimal(dict(trace))
+
+        # Guarantee PK is present and is a string.
+        item["run_id"] = str(trace.get("run_id", "unknown"))
+
+        # Readable timestamp for DynamoDB console sorting.
+        item["ts"] = Decimal(str(round(time.time(), 3)))
+
+        # TTL: epoch seconds N days from now. DynamoDB removes the item after
+        # this time, within a 48-hour window (deletions are free).
+        if ttl_days > 0:
+            item["expires_at"] = int(time.time()) + ttl_days * 86_400
+
+        # Strip None values — boto3 resource layer rejects them without explicit
+        # NULL type handling. Omitting is cleaner than sending NULL.
+        item = {k: v for k, v in item.items() if v is not None}
+
+        table.put_item(Item=item)
+        log.debug(f"[AWS] Trace persisted  run_id={item['run_id']}")
+
+    except Exception as exc:
+        log.error(f"[AWS] DynamoDB put_trace failed  run_id={trace.get('run_id')}  error={exc}")
+
+
+def get_trace_item(table_name: str, run_id: str, region: str = "us-east-1") -> dict | None:
+    """
+    Fetch a single trace item from DynamoDB by run_id.
+
+    Intended for admin/debug endpoints — not on the hot agent path.
+
+    Args:
+        table_name: DynamoDB table name.
+        run_id:     Trace primary key.
+        region:     AWS region.
+
+    Returns:
+        The item dict, or None if not found or on error.
+    """
+    try:
+        table  = _dynamodb(region).Table(table_name)
+        result = table.get_item(Key={"run_id": run_id})
+        return result.get("Item")
+    except Exception as exc:
+        log.error(f"[AWS] DynamoDB get_trace failed  run_id={run_id}  error={exc}")
+        return None

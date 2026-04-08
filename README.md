@@ -219,6 +219,100 @@ aws ssm put-parameter --name /clinical-agent/dev/platform/api_key \
 
 ---
 
+## Episodic Memory
+
+The agent remembers past interactions per user across sessions using Pinecone
+as the episodic store. This is completely separate from the semantic cache.
+
+### The problem it solves
+
+Without episodic memory, every session starts blank:
+
+```
+Session 1:  "What is the metformin dose for my patient with eGFR 25?"
+            Agent gives a detailed answer.
+
+Session 2:  "Is that dose still safe?"
+            Agent: "Which dose? Which patient?" ← forgot everything
+```
+
+With episodic memory, past context is retrieved and injected automatically:
+
+```
+Session 2:  Agent sees → "Previous: User asked about metformin dosing
+                          for eGFR 25 and received 500mg twice daily"
+            Agent: "Based on our previous discussion about eGFR 25 dosing..."
+```
+
+### The core idea — relevant retrieval, not full state passing
+
+The naive approach is to pass the entire conversation history to the LLM.
+This breaks fast:
+
+```
+Session 1:   10 messages  →   ~2,000 tokens
+Session 10: 100 messages  →  ~20,000 tokens  ← expensive, hits context limit
+```
+
+Episodic memory solves this by storing past Q&A pairs in Pinecone and
+retrieving only the **top 3 most relevant** ones for the current question:
+
+```
+User asks current question
+      ↓
+Embed question → search Pinecone (episodic__user_abc namespace)
+      ↓
+Returns top 3 semantically similar past Q&As
+      ↓
+@dynamic_prompt injects them into the system prompt
+      ↓
+LLM sees: current question + 3 relevant memories  (~500 tokens, always bounded)
+```
+
+Two benefits of this approach:
+
+**Bounded cost** — 3 sessions or 300 sessions, the LLM always sees the same
+number of tokens. The context window never fills up regardless of how long
+the user has been interacting with the agent.
+
+**Relevance over recency** — a memory from 20 sessions ago surfaces if it is
+semantically related to today's question. Pure state passing would miss it
+entirely once older messages fall outside the context window.
+
+This is why it is called *episodic* — borrowed from human psychology.
+Episodic memory in humans is how you recall a specific past experience
+when something in the present triggers it, not by replaying your entire life history.
+
+### How the LLM decides what to store
+
+The system prompt instructs the LLM to end every response with `EPISODIC: YES`
+or `EPISODIC: NO`. The middleware reads this tag and stores or skips accordingly.
+
+A keyword rule cannot make this decision reliably. Both questions contain "eGFR":
+
+```
+"What is the normal eGFR range?"         → generic, any user would ask this → NO
+"What dose for my patient with eGFR 25?" → specific to this user's patient  → YES
+```
+
+Only the LLM understands the difference. And since the LLM is already running,
+adding the tag costs zero extra tokens.
+
+The tag is always stripped before the answer reaches the user — it is internal
+metadata only.
+
+### How it is different from Semantic Cache
+
+| | Episodic Memory | Semantic Cache |
+|---|---|---|
+| Scope | Private per user | Shared across all users |
+| On retrieval | Agent still runs, context enriched | Agent skipped entirely |
+| Stores | User-specific interactions | Generic reusable answers |
+| Example | "This user's patient has eGFR 25" | "Metformin Phase 3 results" |
+| Purpose | Personalisation | Cost saving |
+
+---
+
 ## Semantic Cache
 
 The platform includes a Pinecone-backed semantic cache (`SemanticCacheMiddleware`)
@@ -280,67 +374,43 @@ episodic__*    → episodic memory (separate from cache)
 Namespaces are isolated so a pharma cached answer can never bleed into a general
 agent query, and vice versa.
 
-### Middleware execution order — why it matters
+### Middleware execution order — simple mental model
 
-The 9-layer stack executes in **opposite directions** for `before_agent` and `after_agent`.
-This is the standard "onion" pattern and is critical to understand when reasoning about
-where each middleware sits in the stack.
+The stack list order is the **request order**. The response order is simply **reversed**.
 
 ```
-before_agent (ingress →)    1 → 2 → 3 → 4 → 5 → 6 → 7 → 8 → 9 → Agent
-after_agent  (egress  ←)    1 ← 2 ← 3 ← 4 ← 5 ← 6 ← 7 ← 8 ← 9 ← Agent
+Request  →   Tracer → PII → ContentFilter → SemanticCache → ... → OutputGuardrail → Agent
+Response ←   Tracer ← PII ← ContentFilter ← SemanticCache ← ... ← OutputGuardrail ← Agent
 ```
 
-Think of it as nested function calls — the outermost layer (1) wraps everything:
+Think of it like airport security — you pass through the same checkpoints going in
+and coming out, just in reverse.
 
+Your actual logs confirm this:
 ```
-Tracer(                          # before_agent first,  after_agent LAST
-  PII(
-    ContentFilter(
-      SemanticCache(             # before_agent 4th,    after_agent 6th from end
-        EpisodicMemory(
-          Summarization(
-            HITL(
-              ActionGuardrail(
-                OutputGuardrail( # before_agent LAST,   after_agent FIRST
-                  Agent()
-                )
-              )
-            )
-          )
-        )
-      )
-    )
-  )
-)
+# Request (top to bottom)
+[CONTENT_FILTER]  Passed
+[CACHE_MW]        MISS — proceeding to agent
+...agent runs...
+
+# Response (bottom to top — reverse)
+[OUTPUT_GUARD]    PASSED        ← runs first on response
+[ACTION_GUARD]    tool_calls=2  ← runs second
+[CACHE_MW]        storing...    ← runs third  ✅ guardrail scores already available
+[TRACER]          run_complete  ← runs last
 ```
 
-Your actual logs confirm this — after a normal agent run:
-```
-[OUTPUT_GUARD]  PASSED          ← after_agent fires first  (position 9)
-[ACTION_GUARD]  tool_calls=2    ← after_agent fires second (position 8)
-[EPISODIC]      LLM tagged NO   ← after_agent fires third  (position 5)
-[CACHE_MW]      storing...      ← after_agent fires fourth (position 4)
-[TRACER]        run_complete    ← after_agent fires last   (position 1)
-```
+**The one thing students need to remember:**
 
-**Why SemanticCacheMiddlewareWithRules must stay at position 4:**
+> On the response side, whatever is at the **bottom of the stack runs first**.
 
-`after_agent` needs `_cache_faithfulness` (from OutputGuardrail, position 9) and
-`_cache_tool_count` (from ActionGuardrail, position 8) to be in state before it runs.
-Because after_agent is reverse order, positions 9 and 8 execute *before* position 4
-on egress — so the signals are always available when the cache write decision is made.
+This is why `SemanticCacheMiddlewareWithRules` works correctly at position 4.
+By the time it runs on the response side, `OutputGuardrail` (position 9) and
+`ActionGuardrail` (position 8) have already finished and written their scores
+into state. The cache can read `faithfulness` and `tool_count` and make the right decision.
 
-If SemanticCache were moved to position 9, its `after_agent` would fire *first* on
-egress — before the guardrails have written anything — and all rule checks would fall
-back to defaults (`tool_count=0`, `faithfulness=1.0`), silently bypassing the policy.
-
-**Why position 4 is also correct for the lookup (before_agent):**
-
-On ingress (left to right), positions 1–3 run before SemanticCache:
-- PII redaction (2) runs first → cache stores the *redacted* question, never raw PII
-- ContentFilter (3) runs first → toxic content never reaches the cache at all
-- On a HIT, `jump_to="end"` skips positions 5–9 entirely — the entire expensive pipeline
+If SemanticCache were moved to position 9 (bottom), it would run first on the
+response side — before the guardrails — and those scores would not exist yet.
 
 ### Future: pub/sub write path
 

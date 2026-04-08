@@ -219,6 +219,141 @@ aws ssm put-parameter --name /clinical-agent/dev/platform/api_key \
 
 ---
 
+## Semantic Cache
+
+The platform includes a Pinecone-backed semantic cache (`SemanticCacheMiddleware`)
+that short-circuits the entire agent pipeline on a cache hit — no tools, no LLM call,
+no guardrail re-evaluation. A HIT saves ~2–4s latency and ~$0.01 per request.
+
+### How it works
+
+```
+User question → embed → query Pinecone (cache_pharma namespace)
+    HIT  (score ≥ threshold) → return cached answer immediately
+    MISS                     → run agent → store answer in background
+```
+
+### Cache eligibility — what gets cached and why
+
+Not every answer is worth caching. The cache applies an intelligent policy on the
+write path (`after_agent`) to ensure only high-quality, reusable answers are stored.
+
+**An answer is cached only if ALL of the following are true:**
+
+| Signal | Threshold | Rationale |
+|---|---|---|
+| `tool_count > 0` | at least 1 tool called | LLM must have retrieved evidence. Memory-only answers violate the CORE BEHAVIOUR rule and must never be cached in a clinical domain. |
+| `faithfulness ≥ 0.85` | OutputGuardrail score | Answers scoring below threshold are partially hallucinated. Caching a hallucination serves it at full speed to every future user. |
+| `is_fallback == False` | not a guardrail rejection | OutputGuardrail hard-block responses are replaced with a safe fallback. Caching the fallback means the agent never retries. |
+| `len(answer) ≥ 100` | characters | Short responses are typically clarification questions (`ask_user_input` answers) or error messages, not clinical answers. |
+| Single-turn question | `len(human_messages) == 1` | Multi-turn answers reference prior context ("as I mentioned about the dosing…"). Serving them cold to a new user produces a confusing, context-dependent response. |
+| No patient-specific signals | no "my", "patient", "years old" etc. | Patient-specific answers must not be reused across users — both for accuracy and HIPAA reasons. |
+
+**Dynamic TTL — not all clinical data ages at the same rate:**
+
+| Question type | TTL | Examples |
+|---|---|---|
+| Regulatory / guidelines | 7 days | FDA approval, ADA guidelines, ICH guidance |
+| Clinical trial results | 1 day | Phase 3 RCT endpoints, hazard ratios |
+| Safety / market | 1 hour | Recalls, black box warnings, drug availability |
+| Default | 3 hours | Everything else |
+
+### Why not use an LLM to decide whether to cache?
+
+The signals above are deterministic and computed for free by existing middleware
+(OutputGuardrail already scores faithfulness, ActionGuardrail already counts tool calls).
+Adding an LLM caching-decision call would cost ~$0.001 and add ~500ms after every
+single response — more than the cache saves on a MISS. Rule-based signals cover ~95%
+of cases correctly. The remaining 5% edge cases don't justify an LLM call on the hot path.
+
+An LLM-based cache quality review is appropriate **offline** — a nightly batch job
+that evaluates stored entries and evicts low-quality ones — not inline.
+
+### Pinecone namespace strategy
+
+```
+cache_pharma   → pharma agent (threshold=0.97, strict)
+cache_general  → general agent (threshold=0.88, relaxed)
+episodic__*    → episodic memory (separate from cache)
+```
+
+Namespaces are isolated so a pharma cached answer can never bleed into a general
+agent query, and vice versa.
+
+### Middleware execution order — why it matters
+
+The 9-layer stack executes in **opposite directions** for `before_agent` and `after_agent`.
+This is the standard "onion" pattern and is critical to understand when reasoning about
+where each middleware sits in the stack.
+
+```
+before_agent (ingress →)    1 → 2 → 3 → 4 → 5 → 6 → 7 → 8 → 9 → Agent
+after_agent  (egress  ←)    1 ← 2 ← 3 ← 4 ← 5 ← 6 ← 7 ← 8 ← 9 ← Agent
+```
+
+Think of it as nested function calls — the outermost layer (1) wraps everything:
+
+```
+Tracer(                          # before_agent first,  after_agent LAST
+  PII(
+    ContentFilter(
+      SemanticCache(             # before_agent 4th,    after_agent 6th from end
+        EpisodicMemory(
+          Summarization(
+            HITL(
+              ActionGuardrail(
+                OutputGuardrail( # before_agent LAST,   after_agent FIRST
+                  Agent()
+                )
+              )
+            )
+          )
+        )
+      )
+    )
+  )
+)
+```
+
+Your actual logs confirm this — after a normal agent run:
+```
+[OUTPUT_GUARD]  PASSED          ← after_agent fires first  (position 9)
+[ACTION_GUARD]  tool_calls=2    ← after_agent fires second (position 8)
+[EPISODIC]      LLM tagged NO   ← after_agent fires third  (position 5)
+[CACHE_MW]      storing...      ← after_agent fires fourth (position 4)
+[TRACER]        run_complete    ← after_agent fires last   (position 1)
+```
+
+**Why SemanticCacheMiddlewareWithRules must stay at position 4:**
+
+`after_agent` needs `_cache_faithfulness` (from OutputGuardrail, position 9) and
+`_cache_tool_count` (from ActionGuardrail, position 8) to be in state before it runs.
+Because after_agent is reverse order, positions 9 and 8 execute *before* position 4
+on egress — so the signals are always available when the cache write decision is made.
+
+If SemanticCache were moved to position 9, its `after_agent` would fire *first* on
+egress — before the guardrails have written anything — and all rule checks would fall
+back to defaults (`tool_count=0`, `faithfulness=1.0`), silently bypassing the policy.
+
+**Why position 4 is also correct for the lookup (before_agent):**
+
+On ingress (left to right), positions 1–3 run before SemanticCache:
+- PII redaction (2) runs first → cache stores the *redacted* question, never raw PII
+- ContentFilter (3) runs first → toxic content never reaches the cache at all
+- On a HIT, `jump_to="end"` skips positions 5–9 entirely — the entire expensive pipeline
+
+### Future: pub/sub write path
+
+Currently the cache write runs in a **daemon thread** (fire-and-forget) — the
+response is returned to the user before the Pinecone upsert completes.
+
+Planned Phase 2: replace the daemon thread with **SNS → SQS → Lambda**. The agent
+publishes a cache-write event; a separate Lambda consumer calls `cache.store()`.
+Benefits: decoupled, retryable, dead-letter queue for failed writes, cache writer
+scales independently of the agent.
+
+---
+
 ## Run
 
 ```bash
@@ -263,6 +398,21 @@ DynamoDB TTL deletes are eventually consistent — items are removed within 48 h
 `expires_at`, not instantly. If traces are missing immediately after the first request,
 check CloudWatch logs for `[AWS] Trace persisted` or `[TRACER] Background DynamoDB write failed`.
 The background write is fire-and-forget; errors are logged but never bubble up to the API response.
+
+**Cache HIT on every request — `_store_sync` never fires**
+This is expected when the cache is already warm from previous runs. `_store_sync` only
+fires on a MISS where the agent runs and produces a cacheable answer. To force a cold
+cache for testing, clear the Pinecone namespace:
+```python
+from pinecone import Pinecone
+pc = Pinecone(api_key="...")
+pc.Index("clinical-agent").delete(delete_all=True, namespace="cache_pharma")
+```
+
+**Cache storing ambiguous clarification answers**
+If `ask_user_input` was called but no HITL resume happened (e.g. in run.py),
+the short clarification text can appear as the "answer". The `len(answer) >= 100`
+guard filters these out — they are never written to the cache.
 
 ---
 

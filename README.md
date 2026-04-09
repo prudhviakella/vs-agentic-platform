@@ -301,6 +301,49 @@ adding the tag costs zero extra tokens.
 The tag is always stripped before the answer reaches the user — it is internal
 metadata only.
 
+### How episodic memory and summarization work together
+
+These two middleware layers complement each other — understanding both together
+is key to understanding why the architecture scales.
+
+**SummarizationMiddleware** fires when the state grows beyond 3,000 tokens.
+It compresses old messages into a single summary message, keeping state small.
+When it runs, the episodic SystemMessages injected in prior turns get compressed too.
+
+**EpisodicMemoryMiddleware** is not affected by this — the actual memories live
+permanently in Pinecone, not in state. The next `before_agent` simply fetches
+fresh relevant memories for the new question and injects them again.
+
+```
+Session grows large (3,000+ tokens)
+      ↓
+SummarizationMiddleware compresses old messages including old episodic context
+      ↓
+State is small again
+      ↓
+Next turn — EpisodicMemoryMiddleware searches Pinecone for the new question
+      ↓
+Injects fresh relevant memories as a new SystemMessage ✅
+```
+
+The result is a clean two-layer memory architecture:
+
+```
+State (in memory)    → always small, summarized, bounded
+                       working memory for the current conversation
+
+Pinecone (episodic)  → permanent, full fidelity, semantically searchable
+                       long-term memory across all sessions
+```
+
+State is the **working memory**. Pinecone is the **long-term memory**.
+Summarization keeps working memory clean.
+Episodic retrieval keeps pulling from long-term memory as needed.
+
+Even after summarization throws away old episodic SystemMessages, nothing
+is lost — Pinecone still has every stored memory at full fidelity. The next
+turn retrieves exactly what is relevant to the new question.
+
 ### How it is different from Semantic Cache
 
 | | Episodic Memory | Semantic Cache |

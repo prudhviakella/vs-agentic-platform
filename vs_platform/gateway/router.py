@@ -10,15 +10,15 @@ Endpoints:
 
 Agent routing:
   The {agent} path parameter maps to a registered agent factory.
-  New agents are registered in AGENT_REGISTRY — no code changes elsewhere.
+  New agents are added to AGENT_REGISTRY — no code changes elsewhere.
 
   Current registry:
-    "clinical-trial" → clinical_trial_agent.agent.agent.build_agent
+    "clinical-trial" -> clinical_trial_agent.agent.agent.build_agent
 
 HITL flow:
-  POST /chat   → response.interrupted=True + interrupt_payload
+  POST /chat   -> response.interrupted=True + interrupt_payload
   (user reads question, submits answer)
-  POST /resume → response.interrupted=False + final answer
+  POST /resume -> response.interrupted=False + final answer
 
 Error handling:
   All agent exceptions are caught and returned as structured ErrorResponse.
@@ -49,28 +49,22 @@ router = APIRouter(prefix="/api/v1", tags=["agents"])
 
 def _load_clinical_trial_agent(domain: str):
     from agent.agent import build_agent
-    return build_agent(domain=domain)
+    return build_agent(domain=domain, use_postgres=True)
 
 
-# Maps URL path segment → agent factory function.
-# Each factory is called once and the agent is cached per domain.
+# Maps URL path segment -> agent factory function.
+# Each factory is called once and the result is cached per (agent, domain).
 AGENT_REGISTRY: dict[str, Callable] = {
     "clinical-trial": _load_clinical_trial_agent,
 }
 
-# Agent instance cache — one per (agent_name, domain) pair.
+# One agent instance per (agent_name, domain) -- avoids rebuilding on every request.
+# build_agent() fetches AWS credentials, creates Pinecone clients, and opens a
+# PostgresSaver connection -- expensive operations that must not repeat per request.
 _agent_cache: dict[str, Any] = {}
 
 
 def _get_agent(agent_name: str, domain: str) -> Any:
-    """
-    Return a cached agent instance, building it on first call.
-
-    WHY cache agents:
-      build_agent() fetches credentials from AWS, creates Pinecone clients,
-      and sets up a PostgresSaver connection — expensive operations that
-      should not repeat on every request.
-    """
     key = f"{agent_name}:{domain}"
     if key not in _agent_cache:
         factory = AGENT_REGISTRY.get(agent_name)
@@ -84,15 +78,31 @@ def _get_agent(agent_name: str, domain: str) -> Any:
     return _agent_cache[key]
 
 
+def _extract_answer(messages: list) -> str:
+    """Extract the last AI answer from the message list, skipping tool call messages."""
+    for msg in reversed(messages):
+        if hasattr(msg, "content") and msg.content and \
+           not getattr(msg, "tool_calls", None):
+            return str(msg.content)
+    return ""
+
+
+def _build_interrupt_payload(response: dict) -> dict:
+    """Extract the HITL interrupt payload from a LangGraph interrupt response."""
+    action = response["__interrupt__"][0].value["action_requests"][0]
+    return {
+        "question":       action["args"]["question"],
+        "options":        action["args"]["options"],
+        "allow_freetext": action["args"].get("allow_freetext", True),
+    }
+
+
 # ── Routes ─────────────────────────────────────────────────────────────────────
 
 @router.get("/health")
 async def health() -> dict:
-    """Liveness check — returns 200 with platform status."""
-    return {
-        "status":  "ok",
-        "agents":  list(AGENT_REGISTRY.keys()),
-    }
+    """Liveness check."""
+    return {"status": "ok", "agents": list(AGENT_REGISTRY.keys())}
 
 
 @router.post(
@@ -114,30 +124,20 @@ async def chat(
     """
     Send a message to the specified agent and get a response.
 
-    Request flow:
-      1. Auth validated by require_auth dependency.
-      2. Rate limit checked by check_rate_limit dependency.
-      3. Prompt injection check runs on the message content.
-      4. Agent is retrieved from cache (or built on first call).
-      5. Agent invoked — may return a final answer or a HITL interrupt.
-      6. Response structured and returned with trace metadata.
+    Only the current message is passed to invoke() -- not the full history.
+    PostgresSaver restores prior message history from the checkpoint using
+    thread_id, so passing history again would duplicate messages in state.
 
-    When interrupted=True:
-      The agent paused for human input (ask_user_input tool was called).
-      The caller must read interrupt_payload.question + options, collect
-      the human's answer, and POST to /resume with the same thread_id.
+    When interrupted=True the agent paused for human input (ask_user_input
+    was called). POST to /resume with the same thread_id to continue.
     """
     request_id = get_current_request_id()
     t0         = time.perf_counter()
 
-    # Gateway-level injection check — runs before the agent is invoked.
-    check_injection(body.message, request_id=request_id)
-
     try:
-        instance = _get_agent(agent, body.domain)
+        check_injection(body.message, request_id=request_id)
 
-        messages = [{"role": m.role, "content": m.content} for m in body.history]
-        messages.append({"role": "user", "content": body.message})
+        instance = _get_agent(agent, body.domain)
 
         config  = {"configurable": {"thread_id": body.thread_id}}
         context = {
@@ -146,43 +146,28 @@ async def chat(
             "domain":     body.domain,
         }
 
+        # Only pass the new message -- PostgresSaver restores prior history
         response = instance.invoke(
-            {"messages": messages},
+            {"messages": [{"role": "user", "content": body.message}]},
             config=config,
             context=context,
         )
 
         elapsed = round((time.perf_counter() - t0) * 1_000, 2)
 
-        # ── HITL interrupt ─────────────────────────────────────────────────
         if response.get("__interrupt__"):
-            interrupt_val = response["__interrupt__"][0].value
-            action        = interrupt_val["action_requests"][0]
             return ChatResponse(
                 answer            = "",
                 thread_id         = body.thread_id,
                 request_id        = request_id,
                 interrupted       = True,
-                interrupt_payload = {
-                    "question":       action["args"]["question"],
-                    "options":        action["args"]["options"],
-                    "allow_freetext": action["args"].get("allow_freetext", True),
-                },
-                agent      = agent,
-                latency_ms = elapsed,
+                interrupt_payload = _build_interrupt_payload(response),
+                agent             = agent,
+                latency_ms        = elapsed,
             )
 
-        # ── Final answer ───────────────────────────────────────────────────
-        messages_out = response.get("messages", [])
-        answer = ""
-        for msg in reversed(messages_out):
-            if hasattr(msg, "content") and msg.content and \
-               not getattr(msg, "tool_calls", None):
-                answer = str(msg.content)
-                break
-
         return ChatResponse(
-            answer     = answer,
+            answer     = _extract_answer(response.get("messages", [])),
             thread_id  = body.thread_id,
             request_id = request_id,
             agent      = agent,
@@ -219,7 +204,7 @@ async def resume(
     Resume a paused HITL conversation with the human's answer.
 
     The agent retrieves the paused graph state from PostgresSaver using
-    thread_id, injects the user_answer, and continues execution.
+    thread_id, injects user_answer, and continues from where it stopped.
     Returns the final answer once no more interrupts remain.
     """
     from langgraph.types import Command
@@ -228,7 +213,14 @@ async def resume(
     t0         = time.perf_counter()
 
     try:
-        instance = _get_agent(agent, "pharma")   # domain preserved in checkpoint
+        instance = _get_agent(agent, body.domain)
+
+        config  = {"configurable": {"thread_id": body.thread_id}}
+        context = {
+            "user_id":    auth.user_id,
+            "session_id": body.thread_id,
+            "domain":     body.domain,
+        }
 
         resume_command = Command(
             resume={
@@ -242,37 +234,23 @@ async def resume(
             }
         )
 
-        config   = {"configurable": {"thread_id": body.thread_id}}
-        response = instance.invoke(resume_command, config=config)
+        response = instance.invoke(resume_command, config=config, context=context)
         elapsed  = round((time.perf_counter() - t0) * 1_000, 2)
 
-        # Another interrupt — agent asked a follow-up question
+        # Agent asked a follow-up question
         if response.get("__interrupt__"):
-            interrupt_val = response["__interrupt__"][0].value
-            action        = interrupt_val["action_requests"][0]
             return ChatResponse(
                 answer            = "",
                 thread_id         = body.thread_id,
                 request_id        = request_id,
                 interrupted       = True,
-                interrupt_payload = {
-                    "question": action["args"]["question"],
-                    "options":  action["args"]["options"],
-                },
-                agent      = agent,
-                latency_ms = elapsed,
+                interrupt_payload = _build_interrupt_payload(response),
+                agent             = agent,
+                latency_ms        = elapsed,
             )
 
-        messages_out = response.get("messages", [])
-        answer = ""
-        for msg in reversed(messages_out):
-            if hasattr(msg, "content") and msg.content and \
-               not getattr(msg, "tool_calls", None):
-                answer = str(msg.content)
-                break
-
         return ChatResponse(
-            answer     = answer,
+            answer     = _extract_answer(response.get("messages", [])),
             thread_id  = body.thread_id,
             request_id = request_id,
             agent      = agent,

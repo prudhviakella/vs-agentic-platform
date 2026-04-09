@@ -7,7 +7,7 @@ Management + SSM. Provides list, activate, and rollback operations.
 How prompt versioning works:
   - The prompt template text lives in Bedrock Prompt Management.
   - The active version pointer lives in SSM:
-      /{app_name}/{env}/bedrock/prompt_version  ← e.g. "3"
+      /{app_name}/{env}/bedrock/prompt_version  <- e.g. "3"
   - Activating a version = updating that SSM parameter.
   - The agent's prompt.py reads SSM on every request — change takes
     effect on the next request with zero downtime.
@@ -16,28 +16,24 @@ Rollback strategy:
   SSM stores only the current active version, not history. The manager
   maintains a simple previous_version key in SSM:
     /{app_name}/{env}/bedrock/prompt_version_previous
-  Rollback sets active ← previous and previous ← active.
+  Rollback sets active <- previous and previous <- active.
   Only one level of rollback is supported — for deeper history, use
-  Bedrock's native version history.
-
-Bedrock Prompt Management operations used:
-  GetPrompt        — fetch template + metadata for a specific version
-  ListPromptVersions — list all versions for a prompt resource
+  the activate endpoint with an explicit version number.
 """
 
 import logging
 from dataclasses import dataclass
 from typing import Optional
+from functools import lru_cache
 
 import boto3
 from botocore.exceptions import ClientError
-from functools import lru_cache
 
 from core import aws
 
 log = logging.getLogger(__name__)
 
-# Map agent URL slug → SSM app_name prefix
+# Maps agent URL slug -> SSM app_name prefix
 AGENT_APP_NAMES = {
     "clinical-trial": "clinical-trial-agent",
 }
@@ -73,10 +69,6 @@ def get_active_version(app_name: str, env: str) -> str:
 def list_versions(agent_slug: str, env: str) -> list[PromptVersionInfo]:
     """
     List all available Bedrock prompt versions for the given agent.
-
-    Combines Bedrock version metadata with SSM active version to
-    produce a complete list with is_active flags.
-
     Returns versions in descending order (newest first).
     """
     app_name   = _resolve_app_name(agent_slug)
@@ -105,27 +97,17 @@ def list_versions(agent_slug: str, env: str) -> list[PromptVersionInfo]:
 def activate_version(agent_slug: str, env: str, version: str, reason: str = "") -> tuple[str, str]:
     """
     Activate a specific prompt version by updating SSM.
-
-    Saves current active version as 'previous' to enable one-step rollback.
-
-    Returns:
-        (previous_version, activated_version)
-
-    Raises:
-        ValueError — version does not exist in Bedrock.
-        botocore.exceptions.ClientError — SSM write failed.
+    Saves the current active version as 'previous' to enable one-step rollback.
+    Returns (previous_version, activated_version).
     """
-    app_name   = _resolve_app_name(agent_slug)
-    previous   = get_active_version(app_name, env)
+    app_name = _resolve_app_name(agent_slug)
+    previous = get_active_version(app_name, env)
 
-    # Validate the version exists before updating SSM
-    _validate_version_exists(app_name, env, version)
+    # Validate version exists before touching SSM
+    _validate_version_exists(agent_slug, env, version)
 
-    # Store previous for rollback
     _put_ssm(app_name, env, "prompt_version_previous", previous)
-
-    # Activate new version
-    _put_ssm(app_name, env, "prompt_version", version)
+    _put_ssm(app_name, env, "prompt_version",          version)
 
     log.info(
         "[PROMPT_MGR] Version activated",
@@ -143,17 +125,10 @@ def activate_version(agent_slug: str, env: str, version: str, reason: str = "") 
 def rollback_version(agent_slug: str, env: str) -> tuple[str, str]:
     """
     Roll back to the previous prompt version.
-
-    Swaps active ↔ previous in SSM. Only one level of rollback is supported.
-
-    Returns:
-        (rolled_back_from, rolled_back_to)
-
-    Raises:
-        ValueError — no previous version stored (first activation has no history).
+    Swaps active <-> previous in SSM. Only one level of rollback is supported.
+    Returns (rolled_back_from, rolled_back_to).
     """
     app_name = _resolve_app_name(agent_slug)
-
     current  = get_active_version(app_name, env)
     previous = _get_ssm_optional(app_name, env, "prompt_version_previous")
 
@@ -163,7 +138,6 @@ def rollback_version(agent_slug: str, env: str) -> tuple[str, str]:
             "Cannot rollback — this may be the first activation."
         )
 
-    # Swap active ↔ previous
     _put_ssm(app_name, env, "prompt_version",          previous)
     _put_ssm(app_name, env, "prompt_version_previous", current)
 
@@ -183,16 +157,21 @@ def _resolve_app_name(agent_slug: str) -> str:
     return app_name
 
 
-def _validate_version_exists(app_name: str, env: str, version: str) -> None:
-    versions = list_versions(app_name, env)
+def _validate_version_exists(agent_slug: str, env: str, version: str) -> None:
+    """
+    Validate that a version exists in Bedrock before activating it.
+    Takes agent_slug (not app_name) so list_versions can resolve correctly.
+    """
+    versions = list_versions(agent_slug, env)
     known    = {v.version for v in versions}
     if version not in known:
         raise ValueError(f"Version '{version}' does not exist. Available: {sorted(known)}")
 
 
 def _put_ssm(app_name: str, env: str, key: str, value: str) -> None:
+    """Write a value to SSM using the public boto3 client, not a private helper."""
     path = _ssm_path(app_name, env, key)
-    aws._ssm().put_parameter(Name=path, Value=value, Type="String", Overwrite=True)
+    boto3.client("ssm").put_parameter(Name=path, Value=value, Type="String", Overwrite=True)
 
 
 def _get_ssm_optional(app_name: str, env: str, key: str) -> Optional[str]:

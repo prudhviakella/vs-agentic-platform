@@ -4,21 +4,20 @@ gateway/rate_limiter.py — Per-User Rate Limiting
 Enforces request rate limits per user_id using an in-process sliding
 window counter backed by a Python dict.
 
-Limits (configurable via SSM or defaults):
-  default:      60 requests / 60 seconds  (1 req/sec average)
-  premium:      300 requests / 60 seconds
-  service:      unlimited (api_key auth_mode)
+Limits:
+  default:  60 requests / 60 seconds  (1 req/sec average)
+  premium:  300 requests / 60 seconds
+  service:  10,000 requests / 60 seconds (effectively unlimited)
 
 WHY in-process (not Redis):
   In-process is zero-latency and zero-infrastructure for a single-instance
   deployment. For multi-instance deployments (ECS with >1 task), swap
   _WindowStore for a Redis-backed implementation — the interface stays the
-  same. The swap is a one-line change in build_rate_limiter().
+  same.
 
 WHY sliding window (not fixed window):
-  Fixed windows allow 2x the limit at window boundaries (burst at the end
-  of one window + start of the next). Sliding windows distribute traffic
-  evenly and are fairer for sustained users.
+  Fixed windows allow 2x the limit at window boundaries. Sliding windows
+  distribute traffic evenly and are fairer for sustained users.
 
 Sliding window algorithm:
   Maintain a deque of request timestamps per user_id.
@@ -34,20 +33,18 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Dict
 
-from fastapi import HTTPException
+from fastapi import Depends, HTTPException
 
-from vs_platform.gateway.auth import AuthContext
+from vs_platform.gateway.auth import AuthContext, require_auth
 
 log = logging.getLogger(__name__)
 
 
-# ── Window store ───────────────────────────────────────────────────────────────
-
 class _WindowStore:
     """
     In-process sliding window store.
-    Thread-safe for single-threaded async FastAPI (asyncio event loop is single-threaded).
-    For multi-process deployments, replace with RedisWindowStore.
+    Safe for single-threaded async FastAPI (asyncio event loop is single-threaded).
+    For multi-process deployments, replace with a Redis-backed implementation.
     """
 
     def __init__(self):
@@ -55,14 +52,11 @@ class _WindowStore:
 
     def check_and_record(self, key: str, limit: int, window_seconds: int) -> tuple[bool, int]:
         """
-        Check if *key* is within the rate limit and record the attempt.
-
-        Returns:
-            (allowed: bool, remaining: int)
-              allowed   — True if the request is within the limit
-              remaining — number of remaining requests in the current window
+        Check if key is within the rate limit and record the attempt.
+        Returns (allowed, remaining_requests).
         """
-        now = time.time()
+        now    = time.time()
+        cutoff = now - window_seconds
 
         if key not in self._windows:
             self._windows[key] = deque()
@@ -70,23 +64,18 @@ class _WindowStore:
         window = self._windows[key]
 
         # Evict timestamps outside the sliding window
-        cutoff = now - window_seconds
         while window and window[0] < cutoff:
             window.popleft()
 
         if len(window) >= limit:
-            remaining = 0
-            return False, remaining
+            return False, 0
 
         window.append(now)
-        remaining = limit - len(window)
-        return True, remaining
+        return True, limit - len(window)
 
 
 _store = _WindowStore()
 
-
-# ── Limit config ───────────────────────────────────────────────────────────────
 
 @dataclass
 class RateLimit:
@@ -97,34 +86,26 @@ class RateLimit:
 def _get_limit_for(auth: AuthContext) -> RateLimit:
     """
     Select the rate limit tier based on the auth context.
-
-    service accounts (api_key) — unlimited (internal callers are trusted).
-    premium scope              — 300 req / 60s.
-    default                    — 60 req / 60s.
-
-    Extend this function to read per-tenant limits from DynamoDB or SSM
-    when tenant-specific limits are required.
+    Extend this to read per-tenant limits from DynamoDB when needed.
     """
     if auth.auth_mode == "api_key":
-        return RateLimit(limit=10_000, window_seconds=60)  # effectively unlimited
+        return RateLimit(limit=10_000, window_seconds=60)  # internal callers
     if "premium" in auth.scopes:
         return RateLimit(limit=300, window_seconds=60)
     return RateLimit(limit=60, window_seconds=60)
 
 
-# ── FastAPI dependency ─────────────────────────────────────────────────────────
-
-async def check_rate_limit(auth: AuthContext) -> None:
+async def check_rate_limit(auth: AuthContext = Depends(require_auth)) -> None:
     """
     FastAPI dependency — enforces per-user rate limit.
     Raises HTTP 429 with Retry-After header if the limit is exceeded.
 
-    Inject after require_auth in route handlers:
-      @router.post("/chat")
-      async def chat(
-          auth: AuthContext  = Depends(require_auth),
-          _:    None         = Depends(check_rate_limit),   # ← add this
-      ):
+    WHY Depends(require_auth) here (not just AuthContext):
+      FastAPI cannot inject AuthContext automatically — it is a plain
+      dataclass, not a FastAPI dependency. Declaring Depends(require_auth)
+      tells FastAPI to resolve auth via the require_auth dependency first,
+      then pass the result here. Without this, FastAPI would try to read
+      AuthContext from the request body and fail.
     """
     rl  = _get_limit_for(auth)
     key = f"{auth.user_id}:{auth.tenant_id}"

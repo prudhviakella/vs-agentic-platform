@@ -1,16 +1,43 @@
 """
 pinecone_store.py — PineconeStore
 ==================================
-Wraps Pinecone so LangGraph's EpisodicMemoryMiddleware and @dynamic_prompt
-can use it as a store without knowing anything about Pinecone.
+Wraps Pinecone so EpisodicMemoryMiddleware can use it as a store without
+knowing anything about Pinecone internals.
 
-Both of them call store.put() and store.search() — standard LangGraph
-BaseStore methods. We just implement those methods using Pinecone underneath.
+The middleware calls store.put() and store.search() -- standard LangGraph
+BaseStore methods. We implement those methods using Pinecone underneath.
+
+WHY wrap Pinecone in a BaseStore adapter?
+  EpisodicMemoryMiddleware expects any object that has put() and search().
+  Wrapping Pinecone means we can swap the storage backend (e.g. swap Pinecone
+  for Redis or PostgreSQL) without touching any middleware code.
 
 Namespace:
-  LangGraph uses tuples like ("episodic", "user_abc").
-  Pinecone uses plain strings.
-  We join them with "__"  →  "episodic__user_abc"
+  LangGraph uses tuples  → ("episodic", "user_abc")
+  Pinecone uses strings  → "episodic__user_abc"
+  We join with "__" so the parts are always recoverable by splitting on "__".
+
+Vector ID convention:
+  Every vector in Pinecone needs a unique ID.
+  We use  "episodic__user_abc__entry_id"  (namespace + key).
+  Without the namespace prefix, two users with the same entry_id would
+  silently overwrite each other's memories.
+
+Metadata stored per vector:
+  {
+    "namespace":  "episodic__user_abc",
+    "key":        "3f7a92bc",
+    "text":       "Q: metformin dose for eGFR 25?\nA: 500mg...",
+    "ts":         1714000000.0,      <- Unix timestamp for recency sorting
+    "created_at": "2024-04-25T...",  <- ISO for LangGraph Item
+    "updated_at": "2024-04-25T...",
+  }
+
+WHY embed text at write time (not at search time)?
+  Episodic entries are written once and searched many times.
+  Embedding at write time means each search pays only one embedding call
+  (for the query). If we embedded at search time we would need to re-embed
+  every stored entry on every search -- very expensive.
 """
 
 import logging
@@ -27,22 +54,23 @@ log = logging.getLogger(__name__)
 
 
 def _ns(namespace: tuple) -> str:
-    """("episodic", "user_abc")  →  "episodic__user_abc" """
+    """("episodic", "user_abc")  ->  "episodic__user_abc" """
     return "__".join(namespace)
 
 
 def _vid(namespace_str: str, key: str) -> str:
-    """Unique Pinecone vector ID — namespace prefix avoids key collisions."""
+    """Globally unique Pinecone vector ID -- namespace prefix prevents collisions."""
     return f"{namespace_str}__{key}"
 
 
 def _to_item(meta: dict, score: float = None) -> SearchItem:
-    """Rebuild a LangGraph SearchItem from Pinecone metadata."""
-    skip = {"namespace", "key", "created_at", "updated_at"}
+    """Rebuild a LangGraph SearchItem from Pinecone vector metadata."""
+    # These keys belong to the Item envelope, not the value payload
+    envelope_keys = {"namespace", "key", "created_at", "updated_at"}
     return SearchItem(
         namespace=tuple(meta["namespace"].split("__")),
         key=meta["key"],
-        value={k: v for k, v in meta.items() if k not in skip},
+        value={k: v for k, v in meta.items() if k not in envelope_keys},
         created_at=datetime.fromisoformat(meta["created_at"]),
         updated_at=datetime.fromisoformat(meta["updated_at"]),
         score=score,
@@ -53,8 +81,9 @@ class PineconeStore(BaseStore):
     """
     LangGraph BaseStore backed by Pinecone.
 
-    Used by EpisodicMemoryMiddleware (put + search) and @dynamic_prompt (search).
-    Both get the same instance so writes are immediately visible on the next turn.
+    EpisodicMemoryMiddleware writes memories with put() and reads them
+    with search(). Both use the same instance so writes are immediately
+    visible on the next turn.
     """
 
     def __init__(self, index: Any, embedder: OpenAIEmbeddings, top_k: int = 3):
@@ -66,6 +95,7 @@ class PineconeStore(BaseStore):
         return self._embedder.embed_query(text)
 
     # ── LangGraph calls batch() for every get/put/search/delete ───────────
+    # Implementing batch() is enough to satisfy the full BaseStore interface.
 
     def batch(self, ops: Iterable[Op]) -> list[Result]:
         results = []
@@ -83,7 +113,7 @@ class PineconeStore(BaseStore):
         return results
 
     async def abatch(self, ops: Iterable[Op]) -> list[Result]:
-        # Pinecone client is sync — delegate to batch()
+        # Pinecone client is synchronous -- delegate to batch()
         return self.batch(ops)
 
     # ── Handlers ──────────────────────────────────────────────────────────
@@ -101,12 +131,17 @@ class PineconeStore(BaseStore):
             return None
 
     def _put(self, op: PutOp) -> None:
-        """Upsert (value is dict) or delete (value is None)."""
+        """
+        Upsert or delete a single item.
+        value=None means delete. value=dict means upsert.
+
+        We embed the "text" field at write time so future searches only need
+        to embed the query -- not every stored entry on every search.
+        """
         ns  = _ns(op.namespace)
         vid = _vid(ns, op.key)
 
         if op.value is None:
-            # Delete
             try:
                 self._index.delete(ids=[vid], namespace=ns)
                 log.info(f"[STORE] deleted  id={vid}")
@@ -114,7 +149,6 @@ class PineconeStore(BaseStore):
                 log.warning(f"[STORE] delete failed  id={vid}  err={e}")
             return
 
-        # Upsert — embed the text field, store everything else as metadata
         try:
             vector = self._embed(op.value.get("text", op.key))
         except Exception as e:
@@ -127,7 +161,7 @@ class PineconeStore(BaseStore):
             "key":        op.key,
             "created_at": now,
             "updated_at": now,
-            **op.value,
+            **op.value,   # includes "text", "ts", and any other fields
         }
 
         try:
@@ -141,9 +175,13 @@ class PineconeStore(BaseStore):
 
     def _search(self, op: SearchOp) -> list[SearchItem]:
         """
-        Search within a namespace.
-        - query provided  → semantic (vector) search
-        - query empty     → return most recent entries
+        Two modes:
+          query provided -> semantic search (find most RELEVANT memories)
+          query empty    -> recency fetch   (find most RECENT memories)
+
+        EpisodicMemoryMiddleware always passes query=current_question so
+        semantic search is the normal path. Recency fetch exists for admin
+        or debug use cases.
         """
         ns = _ns(op.namespace_prefix)
         if op.query:
@@ -152,7 +190,10 @@ class PineconeStore(BaseStore):
             return self._recent(ns, op.limit)
 
     def _semantic_search(self, ns: str, query: str, limit: int) -> list[SearchItem]:
-        """Embed query → find similar episodic entries in Pinecone."""
+        """
+        Embed the query and find the most similar episodic memories in Pinecone.
+        This is the main search path -- relevance over recency.
+        """
         try:
             resp = self._index.query(
                 vector=self._embed(query),
@@ -173,19 +214,18 @@ class PineconeStore(BaseStore):
     def _recent(self, ns: str, limit: int) -> list[SearchItem]:
         """
         Return the most recent entries by timestamp.
-        Used when query="" — no vector search needed, just recency.
+
+        Pinecone has no native "sort by recency" operation so we list all IDs,
+        fetch their metadata, sort by the "ts" field in Python, and slice.
+        This is fine because episodic memory per user is small (3-20 entries).
         """
         try:
-            # Collect all IDs in this namespace
             all_ids = [id for batch in self._index.list(namespace=ns) for id in batch]
             if not all_ids:
                 return []
 
-            # Fetch metadata for all IDs
             vectors = self._index.fetch(ids=all_ids, namespace=ns).get("vectors", {})
-
-            # Build items, sort by ts (newest first), return top limit
-            items = [_to_item(v["metadata"]) for v in vectors.values()]
+            items   = [_to_item(v["metadata"]) for v in vectors.values()]
             items.sort(key=lambda i: i.value.get("ts", 0), reverse=True)
 
             log.info(f"[STORE] recent fetch  ns={ns}  hits={len(items[:limit])}")

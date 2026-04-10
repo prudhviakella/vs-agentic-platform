@@ -32,6 +32,8 @@ dependencies = [
     "pydantic",
     "tenacity",
     "httpx",
+
+    "neo4j",
 ]
 
 [project.optional-dependencies]

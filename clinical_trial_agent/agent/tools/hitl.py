@@ -24,20 +24,24 @@ def ask_user_input(
     user_answer: str = "",
 ) -> str:
     """
-    Ask the user for a missing piece of information needed to complete the task.
+    Ask the user a clarifying question when the request is genuinely ambiguous.
 
-    Call this once per missing parameter — ask ONE question at a time.
-    Generate options that are SPECIFIC to the user's exact request context.
-    Leave user_answer empty — it will be filled in by the human via the review UI.
+    Only call this when a critical piece of information is completely missing
+    and cannot be inferred from the conversation. If the user has already
+    provided any context or answered a previous question, do NOT call this
+    again — use that context to call tavily_search or search_tool instead.
+
+    Ask ONE question at a time. Generate options that are specific to the
+    user's exact request — never use generic placeholders like 'Option A'.
 
     Args:
         question:       The specific clarifying question to ask the user.
-        options:        Contextually relevant choices — derived from the user's
-                        actual request, never generic placeholders like 'Option A'.
+        options:        Contextually relevant choices derived from the user's
+                        actual request context.
         allow_freetext: Whether the user can type a custom answer beyond the options.
         user_answer:    Leave empty. The human's answer is injected here on resume.
 
     Returns:
-        The human's answer as a string. Use this value to complete the task.
+        The human's answer as a string. Use this to search and complete the task.
     """
     return user_answer  # Human's answer flows back to LLM as a ToolMessage

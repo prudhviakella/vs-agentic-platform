@@ -73,6 +73,12 @@ class OutputGuardrailMiddleware(BaseAgentMiddleware):
 
     @hook_config(can_jump_to=["end"])
     def after_agent(self, state: AgentState, runtime: Runtime) -> dict[str, Any] | None:
+        # Skip if this is already a fallback response — prevents infinite retry loop.
+        # _safe_fallback sets _cache_is_fallback=True before returning, so when
+        # after_agent fires again on the fallback message, we exit immediately.
+        if state.get("_cache_is_fallback"):
+            return None
+
         messages = state.get("messages", [])
         if not messages:
             return None

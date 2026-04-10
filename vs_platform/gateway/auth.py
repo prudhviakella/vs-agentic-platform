@@ -5,26 +5,18 @@ Two auth modes, selected per request by inspecting headers:
 
   Mode 1 — API Key (always available):
     X-API-Key: <key>
-    In local mode: compared against PLATFORM_API_KEY env var.
-    In AWS mode:   compared against SSM SecureString value.
+    Validated against SSM SecureString /clinical-agent/dev/platform/api_key.
 
   Mode 2 — Bearer JWT (Cognito, optional):
     Authorization: Bearer <jwt>
-    Only active when COGNITO_USER_POOL_ID env var is set (AWS mode)
-    or when APP_ENV != local. In local mode JWT auth is skipped entirely.
+    Only active when Cognito SSM params are present.
 
 Both modes return a unified AuthContext so downstream code is mode-agnostic.
-
-LOCAL DEV MODE (APP_ENV=local):
-  Set PLATFORM_API_KEY=any-value in .env.local.
-  Use X-API-Key: any-value in your requests.
-  JWT/Cognito is not required or validated.
 """
 
 import hmac
 import hashlib
 import logging
-import os
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -38,17 +30,11 @@ log = logging.getLogger(__name__)
 _bearer_scheme = HTTPBearer(auto_error=False)
 
 
-# ── Auth context ───────────────────────────────────────────────────────────────
-
 @dataclass
 class AuthContext:
-    """
-    Unified auth result returned by both Cognito JWT and API key validation.
-    Downstream code (rate limiter, agent router) uses this directly.
-    """
     user_id:   str
     tenant_id: str = "default"
-    auth_mode: str = "jwt"        # "jwt" | "api_key" | "local"
+    auth_mode: str = "api_key"
     scopes:    list = field(default_factory=list)
 
 
@@ -56,23 +42,13 @@ class AuthContext:
 
 def _validate_api_key(api_key: str) -> AuthContext:
     """
-    Validate an API key.
-
-    Local mode: compares against PLATFORM_API_KEY env var.
-    AWS mode:   compares against SSM SecureString (constant-time comparison).
-
+    Validate an API key against SSM SecureString (constant-time comparison).
     Raises HTTPException 401 on mismatch.
     """
-    env = aws.get_env()
-
-    if aws.is_local():
-        stored_key = os.environ.get("PLATFORM_API_KEY", "local-dev-key")
-        log.debug("[AUTH] Local API key validation")
-    else:
-        stored_key = aws.get_ssm_parameter(
-            f"/clinical-agent/{env}/platform/api_key",
-            with_decryption=True,
-        )
+    stored_key = aws.get_ssm_parameter(
+        f"/clinical-agent/{aws.ENV}/platform/api_key",
+        with_decryption=True,
+    )
 
     key_matches = hmac.compare_digest(
         hashlib.sha256(api_key.encode()).digest(),
@@ -83,10 +59,11 @@ def _validate_api_key(api_key: str) -> AuthContext:
         log.warning("[AUTH] API key validation failed")
         raise HTTPException(status_code=401, detail="Invalid API key")
 
+    log.debug("[AUTH] API key validated")
     return AuthContext(
         user_id="service-account",
         tenant_id="internal",
-        auth_mode="api_key" if not aws.is_local() else "local",
+        auth_mode="api_key",
         scopes=["admin"],
     )
 
@@ -94,16 +71,10 @@ def _validate_api_key(api_key: str) -> AuthContext:
 # ── JWT / Cognito auth ─────────────────────────────────────────────────────────
 
 def _cognito_configured() -> bool:
-    """
-    Return True only if Cognito environment is available.
-    In local mode or when SSM params are missing, returns False.
-    """
-    if aws.is_local():
-        return False
+    """Return True only if Cognito SSM params are present."""
     try:
-        env = aws.get_env()
         aws.get_ssm_parameter(
-            f"/clinical-agent/{env}/cognito/user_pool_id",
+            f"/clinical-agent/{aws.ENV}/cognito/user_pool_id",
             with_decryption=False,
         )
         return True
@@ -114,16 +85,14 @@ def _cognito_configured() -> bool:
 def _validate_jwt(token: str) -> AuthContext:
     """
     Validate a Cognito JWT and extract claims.
-    Only called when Cognito is configured (_cognito_configured() == True).
     Raises HTTPException 401 on invalid or expired token.
     """
     try:
         import jwt as pyjwt
         from jwt import PyJWKClient
 
-        env          = aws.get_env()
-        user_pool_id = aws.get_ssm_parameter(f"/clinical-agent/{env}/cognito/user_pool_id", with_decryption=False)
-        region       = aws.get_ssm_parameter(f"/clinical-agent/{env}/cognito/region",        with_decryption=False)
+        user_pool_id = aws.get_ssm_parameter(f"/clinical-agent/{aws.ENV}/cognito/user_pool_id", with_decryption=False)
+        region       = aws.get_ssm_parameter(f"/clinical-agent/{aws.ENV}/cognito/region",        with_decryption=False)
         jwks_uri     = f"https://cognito-idp.{region}.amazonaws.com/{user_pool_id}/.well-known/jwks.json"
         issuer       = f"https://cognito-idp.{region}.amazonaws.com/{user_pool_id}"
 
@@ -159,11 +128,9 @@ async def require_auth(
     FastAPI dependency — validates the request and returns AuthContext.
 
     Priority:
-      1. X-API-Key header  → API key auth (always available, works in local mode)
+      1. X-API-Key header → API key auth (always available)
       2. Authorization: Bearer <jwt> → Cognito JWT (only when Cognito is configured)
       3. Neither → 401 Unauthorized
-
-    Local dev: use X-API-Key: local-dev-key (or whatever PLATFORM_API_KEY is set to).
     """
     api_key = request.headers.get("X-API-Key")
     if api_key:
@@ -180,9 +147,5 @@ async def require_auth(
 
     raise HTTPException(
         status_code=401,
-        detail=(
-            "Authentication required. "
-            "Provide X-API-Key header for API key auth"
-            + (" or Authorization: Bearer <jwt> for Cognito auth." if _cognito_configured() else ".")
-        ),
+        detail="Authentication required. Provide X-API-Key header.",
     )

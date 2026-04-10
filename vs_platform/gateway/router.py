@@ -79,11 +79,30 @@ def _get_agent(agent_name: str, domain: str) -> Any:
 
 
 def _extract_answer(messages: list) -> str:
-    """Extract the last AI answer from the message list, skipping tool call messages."""
+    """
+    Extract the last AI answer from the message list.
+
+    Skips:
+      - Messages with no content
+      - AIMessages that contain tool_calls (these are tool invocations, not answers)
+      - ToolMessages (type == "tool") — these are tool results, not answers
+      - HumanMessages (type == "human") — these are user inputs
+
+    Only returns content from AIMessages that have text content and no
+    pending tool calls — i.e. the final answer turn.
+    """
     for msg in reversed(messages):
-        if hasattr(msg, "content") and msg.content and \
-           not getattr(msg, "tool_calls", None):
-            return str(msg.content)
+        content = getattr(msg, "content", None)
+        if not content:
+            continue
+        # Skip tool call invocations (AI decided to call a tool)
+        if getattr(msg, "tool_calls", None):
+            continue
+        # Skip tool results and human messages
+        msg_type = getattr(msg, "type", "")
+        if msg_type in ("tool", "human"):
+            continue
+        return str(content)
     return ""
 
 

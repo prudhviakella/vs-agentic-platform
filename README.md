@@ -24,10 +24,19 @@ python3.13 -m venv .venv && source .venv/bin/activate
 
 # 2. Install all packages
 pip install --no-cache-dir -r requirements-dev.txt
+pip install neo4j  # graph_tool dependency
 
 # 3. Export environment variables
 export OPENAI_API_KEY="sk-..."
-export APP_ENV="dev"
+export PINECONE_API_KEY="pcsk-..."
+export PINECONE_INDEX_NAME="clinical-agent"
+export CLINICAL_TRIALS_INDEX="clinical-trials-index"
+export NEO4J_URI="neo4j+s://52c31090.databases.neo4j.io"
+export NEO4J_USER="52c31090"
+export NEO4J_PASSWORD="your-neo4j-password"
+export TAVILY_API_KEY="tvly-..."
+export POSTGRES_URL="postgresql://user:pass@localhost:5432/clinical_agent"
+export PLATFORM_API_KEY="local-dev-key"
 ```
 
 ---
@@ -36,32 +45,46 @@ export APP_ENV="dev"
 
 Complete these steps in order before running the agent.
 
-### 1. Pinecone Index
+### 1. Pinecone Indexes
+
+The platform uses **two Pinecone indexes**:
+
+| Index | Purpose | Namespace |
+|---|---|---|
+| `clinical-agent` | Semantic cache + episodic memory | `cache_pharma`, `episodic__*` |
+| `clinical-trials-index` | Clinical trial knowledge base (real data) | `clinical-trials` |
 
 Create via Python:
 
 ```python
 from pinecone import Pinecone, ServerlessSpec
 pc = Pinecone(api_key="your-pinecone-api-key")
+
+# Index 1 — cache + episodic memory
 pc.create_index(
     name="clinical-agent",
-    dimension=1536,       # matches text-embedding-3-small
+    dimension=1536,
+    metric="cosine",
+    spec=ServerlessSpec(cloud="aws", region="us-east-1")
+)
+
+# Index 2 — clinical trial knowledge base
+pc.create_index(
+    name="clinical-trials-index",
+    dimension=1536,
     metric="cosine",
     spec=ServerlessSpec(cloud="aws", region="us-east-1")
 )
 ```
 
-Or create from [app.pinecone.io](https://app.pinecone.io):
-- Name: `clinical-agent`, Dimensions: `1536`, Metric: `cosine`
-- Cloud: `AWS`, Region: `us-east-1`
-
-Wait ~30 seconds for the index to initialize before running the agent.
+Wait ~30 seconds for indexes to initialize before running.
 
 ### 2. Bedrock System Prompt
 
-Always use a JSON file to avoid shell quoting issues.
+The system prompt lives in AWS Bedrock Prompt Management — not in code.
+This allows clinical writers to update prompts without touching the codebase.
 
-**First time — create the prompt:**
+**Create the prompt:**
 
 ```bash
 cat > /tmp/prompt_payload.json << 'ENDJSON'
@@ -74,14 +97,10 @@ cat > /tmp/prompt_payload.json << 'ENDJSON'
       "templateType": "TEXT",
       "templateConfiguration": {
         "text": {
-          "text": "{{domain_frame}}\n\nYou are an expert clinical research assistant with deep knowledge of pharmaceutical drug development, clinical trial design, regulatory frameworks (FDA, EMA, ICH), and evidence-based medicine.\n\nCORE BEHAVIOUR:\n- Always retrieve evidence before answering. Never answer from memory alone.\n- Cite the specific source, trial name, or document for every clinical claim.\n- If the retrieved evidence is insufficient, say so explicitly.\n- Be precise with numbers — dosages, p-values, endpoints, sample sizes matter.\n\nCLARIFICATION RULE — MANDATORY:\nWhen the request is ambiguous, you MUST call the ask_user_input tool.\nDo NOT ask clarifying questions in plain text — ALWAYS use the tool.\nYou may ask AT MOST ONE clarifying question per request.\nAfter receiving the user's answer, you MUST immediately proceed to search and answer — do NOT ask follow-up clarifying questions.\nUse ask_user_input when:\n- The trial name or drug is ambiguous\n- The question could refer to multiple phases or indications\n- The user intent is completely unclear\n\nDISCLAIMERS:\n- Always include: This information is for research purposes only and does not constitute medical advice.\n- Never recommend specific treatments for individual patients.\n- Flag if data is preliminary, unpublished, or from a single study.\n\nTOOL USAGE:\n- Maximum {{max_tool_calls}} tool calls per request.\n- Use search for recent trials and regulatory decisions.\n- Use graph for relationships between drugs, targets, and indications.\n- Use summariser for long documents.\n- Use chart only when visualising data adds clarity.",
+          "text": "{{domain_frame}}\n\nYou are an expert clinical research assistant with deep knowledge of pharmaceutical drug development, clinical trial design, regulatory frameworks (FDA, EMA, ICH), and evidence-based medicine.\n\nCORE BEHAVIOUR:\n- Always retrieve evidence before answering. Never answer from memory alone.\n- Cite the specific source, trial name, or document for every clinical claim.\n- If the retrieved evidence is insufficient, say so explicitly.\n- Be precise with numbers — dosages, p-values, endpoints, sample sizes matter.\n\nCLARIFICATION RULE — MANDATORY:\nAsking questions in plain text is FORBIDDEN. It breaks the interactive UI.\nThe ask_user_input tool is the ONLY permitted way to ask the user a question.\n\nStep 1: If the request needs any clarification, call ask_user_input ONCE.\nStep 2: Once the user answers (any answer), call search_tool IMMEDIATELY.\nStep 3: Answer based on the search results.\n\nSTRICT LIMITS:\n- NEVER write a question in your response text — use ask_user_input instead.\n- NEVER call ask_user_input more than once per conversation.\n- After receiving ANY user answer, go straight to search_tool.\n- The user's answer is always sufficient — search with whatever they gave you.\n\nDISCLAIMERS:\n- Always include: This information is for research purposes only and does not constitute medical advice.\n- Never recommend specific treatments for individual patients.\n- Flag if data is preliminary, unpublished, or from a single study.\n\nTOOL USAGE:\n- Maximum {{max_tool_calls}} tool calls per request.\n- Use search_tool for clinical trial data and drug evidence.\n- Use graph_tool for relationships between drugs, targets, and indications.\n- Use summariser_tool for long documents.\n- Use chart_tool only when visualising data adds clarity.\n\nEPISODIC TAGGING — MANDATORY:\nEnd every response with exactly one of these tags on its own line:\nEPISODIC: YES — if your answer is specific to this user's case, patient, or context\nEPISODIC: NO  — if your answer is generic knowledge that anyone would ask\n\nExamples:\n- 'What is the metformin dose for eGFR 25?' → EPISODIC: YES (patient-specific)\n- 'What is the normal eGFR range?' → EPISODIC: NO (generic knowledge)\n- 'What are the Phase 3 results for Pfizer BNT162b2?' → EPISODIC: NO (public data)",
           "inputVariables": [
-            {
-              "name": "domain_frame"
-            },
-            {
-              "name": "max_tool_calls"
-            }
+            {"name": "domain_frame"},
+            {"name": "max_tool_calls"}
           ]
         }
       }
@@ -108,13 +127,7 @@ aws bedrock-agent create-prompt-version \
 **Updating the prompt — create a new version:**
 
 ```bash
-cat > /tmp/prompt_payload.json << 'ENDJSON'
-{
-  "name": "clinical-trial-agent-system-prompt",
-  "variants": [{ ... updated text ... }]
-}
-ENDJSON
-
+# Edit the JSON file, then:
 aws bedrock-agent update-prompt \
     --prompt-identifier "<prompt-id>" \
     --cli-input-json file:///tmp/prompt_payload.json \
@@ -124,9 +137,9 @@ aws bedrock-agent create-prompt-version \
     --prompt-identifier "<prompt-id>" \
     --region us-east-1
 
-# Point SSM to the new version number
+# Point SSM to the new version
 aws ssm put-parameter \
-    --name /clinical-agent/dev/bedrock/prompt_version \
+    --name /clinical-trial-agent/dev/bedrock/prompt_version \
     --value "<new-version-number>" --type String --overwrite
 
 rm /tmp/prompt_payload.json
@@ -138,8 +151,7 @@ rm /tmp/prompt_payload.json
 # Create the database
 createdb clinical_agent
 
-# Create Secrets Manager secret using a file to avoid quoting issues
-# with special characters in passwords (@, #, % etc.)
+# Create Secrets Manager secret
 cat > /tmp/pg_secret.json << 'ENDJSON'
 {
     "host":     "localhost",
@@ -157,20 +169,11 @@ aws secretsmanager create-secret \
 rm /tmp/pg_secret.json
 ```
 
-LangGraph checkpoint tables are created automatically on first run.
+LangGraph checkpoint tables (HITL state) are created automatically on first run.
 
 ### 4. DynamoDB Trace Table
 
-The DynamoDB table for agent trace persistence is **created automatically** on the
-first request — no manual table creation needed. You only need to register the
-table name in SSM (step 5 below) so the platform knows what to create.
-
-The table is provisioned with:
-- **Billing:** PAY_PER_REQUEST — no capacity planning needed
-- **TTL:** `expires_at` attribute — traces auto-deleted after 30 days (free)
-- **PK:** `run_id` (String) — unique per agent request
-
-IAM role running the platform must have these DynamoDB permissions:
+Created automatically on first request. IAM role must have:
 
 ```json
 {
@@ -186,20 +189,13 @@ IAM role running the platform must have these DynamoDB permissions:
 }
 ```
 
-> **Local dev:** Set `TRACE_TABLE_NAME=clinical-agent-traces` in `.env.local`
-> (or omit it — the platform defaults to `clinical-agent-traces` locally).
-
 ### 5. SSM Parameters
 
-Generate a platform API key first:
 ```bash
+# Generate a platform API key
 python -c "import secrets; print(secrets.token_hex(32))"
-```
 
-Then set all parameters:
-
-```bash
-# Pinecone
+# Pinecone (semantic cache + episodic memory index)
 aws ssm put-parameter --name /clinical-agent/dev/pinecone/api_key \
     --value "pcsk-..." --type SecureString
 
@@ -207,13 +203,13 @@ aws ssm put-parameter --name /clinical-agent/dev/pinecone/index_name \
     --value "clinical-agent" --type String
 
 # Bedrock prompt (IDs from step 2)
-aws ssm put-parameter --name /clinical-agent/dev/bedrock/prompt_id \
+aws ssm put-parameter --name /clinical-trial-agent/dev/bedrock/prompt_id \
     --value "<prompt-id>" --type String
 
-aws ssm put-parameter --name /clinical-agent/dev/bedrock/prompt_version \
+aws ssm put-parameter --name /clinical-trial-agent/dev/bedrock/prompt_version \
     --value "1" --type String
 
-# DynamoDB trace table (table is auto-created on first request)
+# DynamoDB
 aws ssm put-parameter --name /clinical-agent/dev/dynamodb/trace_table_name \
     --value "clinical-agent-traces" --type String
 
@@ -224,324 +220,340 @@ aws ssm put-parameter --name /clinical-agent/dev/platform/api_key \
 
 ---
 
+## Architecture
+
+### Middleware Stack (9 layers)
+
+The middleware stack wraps the agent. Layers run top→bottom on request, bottom→top on response.
+
+```
+Request  →  [1]Tracer → [2]PII → [3]ContentFilter → [4]SemanticCache
+          → [5]EpisodicMemory → [6]Summarization → [7]HITL
+          → [8]ActionGuardrail → [9]OutputGuardrail → Agent
+
+Response ←  [1]Tracer ← [2]PII ← [3]ContentFilter ← [4]SemanticCache
+          ← [5]EpisodicMemory ← [6]Summarization ← [7]HITL
+          ← [8]ActionGuardrail ← [9]OutputGuardrail ← Agent
+```
+
+Think of it like airport security — same checkpoints in and out, just reversed.
+
+| # | Layer | Hook | Purpose |
+|---|---|---|---|
+| 1 | `TracerMiddleware` | before+after | DynamoDB trace persistence, latency logging |
+| 2 | `DomainPIIMiddleware` | before+after | Email/CC redaction on input and output |
+| 3 | `ContentFilterMiddleware` | before | Block toxic/off-domain content |
+| 4 | `SemanticCacheMiddleware` | before+after | Cache HIT skips agent entirely |
+| 5 | `EpisodicMemoryMiddleware` | before+after | Inject past context, store new Q&A |
+| 6 | `SummarizationMiddleware` | wrap_model | Compress state when >3000 tokens |
+| 7 | `HumanInTheLoopMiddleware` | wrap_model | Pause on `ask_user_input`, resume on answer |
+| 8 | `ActionGuardrailMiddleware` | after | Enforce tool call limits |
+| 9 | `OutputGuardrailMiddleware` | after | 3-layer faithfulness check |
+
+### Tools
+
+| Tool | Purpose | HITL? |
+|---|---|---|
+| `ask_user_input` | Pause for human clarification | YES — only tool that pauses |
+| `search_tool` | Vector search on `clinical-trials-index` (Pinecone) | No |
+| `graph_tool` | Cypher queries on Neo4j clinical trials graph | No |
+| `summariser_tool` | Synthesise multiple retrieved chunks | No |
+| `chart_tool` | Generate chart spec from data points | No |
+
+### System Prompt
+
+The system prompt is fetched from **AWS Bedrock Prompt Management** on agent startup.
+`aws.py` reads `prompt_id` and `prompt_version` from SSM, fetches the template from Bedrock,
+and substitutes two placeholders:
+
+- `{{domain_frame}}` — pharma vs general framing (set at agent creation time)
+- `{{max_tool_calls}}` — integer cap from `tools/__init__.py`
+
+There is no local fallback — all environments run against real AWS.
+
+---
+
+## HITL — Human in the Loop
+
+The agent pauses mid-conversation when it needs clarification and resumes after the human answers.
+
+### Flow
+
+```
+POST /chat  {"message": "Show me the trial data", "thread_id": "t1"}
+    ↓
+LLM calls ask_user_input("Which trial?", ["Pfizer BNT162b2", "Remdesivir", ...])
+    ↓
+HumanInTheLoopMiddleware intercepts → graph pauses → checkpoint saved to Postgres
+    ↓
+Response: {"interrupted": true, "interrupt_payload": {"question": ..., "options": [...]}}
+
+POST /resume {"thread_id": "t1", "user_answer": "Pfizer BNT162b2 Phase 3"}
+    ↓
+Agent resumes from Postgres checkpoint → LLM calls search_tool → answers
+    ↓
+Response: {"interrupted": false, "answer": "..."}
+```
+
+### Rules (enforced by system prompt)
+
+- `ask_user_input` is the **only** tool that pauses the agent
+- The LLM may call it **at most once** per conversation
+- After receiving any answer, it **must immediately** call `search_tool`
+- All other tools auto-execute without pausing
+
+### Why `system_prompt=` not `@dynamic_prompt`
+
+`@dynamic_prompt` uses `wrap_model_call` — the same hook type as `HumanInTheLoopMiddleware`.
+Having both in the middleware chain caused HITL to never fire (LLM could call `ask_user_input`
+6 times in one turn without pausing). Passing `system_prompt=` directly to `create_agent()`
+removes the conflict entirely. This is the correct LangChain 1.0 API.
+
+### Resume payload format
+
+```json
+{
+  "thread_id":   "your-thread-id",
+  "user_answer": "Pfizer BNT162b2 COVID-19 vaccine Phase 3",
+  "domain":      "pharma"
+}
+```
+
+---
+
 ## Episodic Memory
 
-The agent remembers past interactions per user across sessions using Pinecone
-as the episodic store. This is completely separate from the semantic cache.
+The agent remembers past interactions per user across sessions.
 
-### The problem it solves
+### The core idea — relevant retrieval, not full history
 
-Without episodic memory, every session starts blank:
-
-```
-Session 1:  "What is the metformin dose for my patient with eGFR 25?"
-            Agent gives a detailed answer.
-
-Session 2:  "Is that dose still safe?"
-            Agent: "Which dose? Which patient?" ← forgot everything
-```
-
-With episodic memory, past context is retrieved and injected automatically:
+Storing full conversation history scales badly:
 
 ```
-Session 2:  Agent sees → "Previous: User asked about metformin dosing
-                          for eGFR 25 and received 500mg twice daily"
-            Agent: "Based on our previous discussion about eGFR 25 dosing..."
+Session 1:    10 messages  →   ~2,000 tokens
+Session 10:  100 messages  →  ~20,000 tokens  ← expensive, hits context limit
 ```
 
-### The core idea — relevant retrieval, not full state passing
-
-The naive approach is to pass the entire conversation history to the LLM.
-This breaks fast:
-
-```
-Session 1:   10 messages  →   ~2,000 tokens
-Session 10: 100 messages  →  ~20,000 tokens  ← expensive, hits context limit
-```
-
-Episodic memory solves this by storing past Q&A pairs in Pinecone and
-retrieving only the **top 3 most relevant** ones for the current question:
-
-```
-User asks current question
-      ↓
-Embed question → search Pinecone (episodic__user_abc namespace)
-      ↓
-Returns top 3 semantically similar past Q&As
-      ↓
-@dynamic_prompt injects them into the system prompt
-      ↓
-LLM sees: current question + 3 relevant memories  (~500 tokens, always bounded)
-```
-
-Two benefits of this approach:
-
-**Bounded cost** — 3 sessions or 300 sessions, the LLM always sees the same
-number of tokens. The context window never fills up regardless of how long
-the user has been interacting with the agent.
-
-**Relevance over recency** — a memory from 20 sessions ago surfaces if it is
-semantically related to today's question. Pure state passing would miss it
-entirely once older messages fall outside the context window.
-
-This is why it is called *episodic* — borrowed from human psychology.
-Episodic memory in humans is how you recall a specific past experience
-when something in the present triggers it, not by replaying your entire life history.
+Episodic memory stores Q&A pairs in Pinecone and retrieves only the **top 3 most relevant**
+ones for the current question — cost is bounded regardless of history length.
 
 ### How the LLM decides what to store
 
-The system prompt instructs the LLM to end every response with `EPISODIC: YES`
-or `EPISODIC: NO`. The middleware reads this tag and stores or skips accordingly.
-
-A keyword rule cannot make this decision reliably. Both questions contain "eGFR":
+The system prompt instructs the LLM to end every response with `EPISODIC: YES` or `EPISODIC: NO`.
+`EpisodicMemoryMiddleware` reads this tag and stores or skips accordingly.
 
 ```
-"What is the normal eGFR range?"         → generic, any user would ask this → NO
-"What dose for my patient with eGFR 25?" → specific to this user's patient  → YES
+"What is the normal eGFR range?"          → EPISODIC: NO  (generic)
+"Dose for my patient with eGFR 25?"       → EPISODIC: YES (patient-specific)
 ```
 
-Only the LLM understands the difference. And since the LLM is already running,
-adding the tag costs zero extra tokens.
-
-The tag is always stripped before the answer reaches the user — it is internal
-metadata only.
+The tag is always stripped before the answer reaches the user — internal metadata only.
 
 ### How episodic memory and summarization work together
 
-These two middleware layers complement each other — understanding both together
-is key to understanding why the architecture scales.
-
-**SummarizationMiddleware** fires when the state grows beyond 3,000 tokens.
-It compresses old messages into a single summary message, keeping state small.
-When it runs, the episodic SystemMessages injected in prior turns get compressed too.
-
-**EpisodicMemoryMiddleware** is not affected by this — the actual memories live
-permanently in Pinecone, not in state. The next `before_agent` simply fetches
-fresh relevant memories for the new question and injects them again.
+`SummarizationMiddleware` compresses old state messages when they exceed 3,000 tokens.
+The actual memories in Pinecone are unaffected — the next turn fetches fresh relevant
+memories from Pinecone and injects them again.
 
 ```
-Session grows large (3,000+ tokens)
-      ↓
-SummarizationMiddleware compresses old messages including old episodic context
-      ↓
-State is small again
-      ↓
-Next turn — EpisodicMemoryMiddleware searches Pinecone for the new question
-      ↓
-Injects fresh relevant memories as a new SystemMessage ✅
+State (in memory)    → always small, summarized   (working memory)
+Pinecone (episodic)  → permanent, full fidelity   (long-term memory)
 ```
 
-The result is a clean two-layer memory architecture:
-
-```
-State (in memory)    → always small, summarized, bounded
-                       working memory for the current conversation
-
-Pinecone (episodic)  → permanent, full fidelity, semantically searchable
-                       long-term memory across all sessions
-```
-
-State is the **working memory**. Pinecone is the **long-term memory**.
-Summarization keeps working memory clean.
-Episodic retrieval keeps pulling from long-term memory as needed.
-
-Even after summarization throws away old episodic SystemMessages, nothing
-is lost — Pinecone still has every stored memory at full fidelity. The next
-turn retrieves exactly what is relevant to the new question.
-
-### How it is different from Semantic Cache
+### Episodic Memory vs Semantic Cache
 
 | | Episodic Memory | Semantic Cache |
 |---|---|---|
 | Scope | Private per user | Shared across all users |
 | On retrieval | Agent still runs, context enriched | Agent skipped entirely |
 | Stores | User-specific interactions | Generic reusable answers |
-| Example | "This user's patient has eGFR 25" | "Metformin Phase 3 results" |
 | Purpose | Personalisation | Cost saving |
 
 ---
 
 ## Semantic Cache
 
-The platform includes a Pinecone-backed semantic cache (`SemanticCacheMiddleware`)
-that short-circuits the entire agent pipeline on a cache hit — no tools, no LLM call,
-no guardrail re-evaluation. A HIT saves ~2–4s latency and ~$0.01 per request.
-
-### How it works
+`SemanticCacheMiddleware` short-circuits the entire pipeline on a cache hit — no tools,
+no LLM call. A HIT saves ~2–4s latency and ~$0.01 per request.
 
 ```
 User question → embed → query Pinecone (cache_pharma namespace)
-    HIT  (score ≥ threshold) → return cached answer immediately
-    MISS                     → run agent → store answer in background
+    HIT  (score ≥ 0.97) → return cached answer immediately
+    MISS                 → run agent → store answer in background
 ```
 
-### Cache eligibility — what gets cached and why
+### Cache eligibility
 
-Not every answer is worth caching. The cache applies an intelligent policy on the
-write path (`after_agent`) to ensure only high-quality, reusable answers are stored.
+An answer is cached only if ALL of these are true:
 
-**An answer is cached only if ALL of the following are true:**
-
-| Signal | Threshold | Rationale |
-|---|---|---|
-| `tool_count > 0` | at least 1 tool called | LLM must have retrieved evidence. Memory-only answers violate the CORE BEHAVIOUR rule and must never be cached in a clinical domain. |
-| `faithfulness ≥ 0.85` | OutputGuardrail score | Answers scoring below threshold are partially hallucinated. Caching a hallucination serves it at full speed to every future user. |
-| `is_fallback == False` | not a guardrail rejection | OutputGuardrail hard-block responses are replaced with a safe fallback. Caching the fallback means the agent never retries. |
-| `len(answer) ≥ 100` | characters | Short responses are typically clarification questions (`ask_user_input` answers) or error messages, not clinical answers. |
-| Single-turn question | `len(human_messages) == 1` | Multi-turn answers reference prior context ("as I mentioned about the dosing…"). Serving them cold to a new user produces a confusing, context-dependent response. |
-| No patient-specific signals | no "my", "patient", "years old" etc. | Patient-specific answers must not be reused across users — both for accuracy and HIPAA reasons. |
-
-**Dynamic TTL — not all clinical data ages at the same rate:**
-
-| Question type | TTL | Examples |
-|---|---|---|
-| Regulatory / guidelines | 7 days | FDA approval, ADA guidelines, ICH guidance |
-| Clinical trial results | 1 day | Phase 3 RCT endpoints, hazard ratios |
-| Safety / market | 1 hour | Recalls, black box warnings, drug availability |
-| Default | 3 hours | Everything else |
-
-### Why not use an LLM to decide whether to cache?
-
-The signals above are deterministic and computed for free by existing middleware
-(OutputGuardrail already scores faithfulness, ActionGuardrail already counts tool calls).
-Adding an LLM caching-decision call would cost ~$0.001 and add ~500ms after every
-single response — more than the cache saves on a MISS. Rule-based signals cover ~95%
-of cases correctly. The remaining 5% edge cases don't justify an LLM call on the hot path.
-
-An LLM-based cache quality review is appropriate **offline** — a nightly batch job
-that evaluates stored entries and evicts low-quality ones — not inline.
+| Signal | Rationale |
+|---|---|
+| Single-turn question | Multi-turn answers reference context that won't exist for another user |
+| No patient-specific signals | HIPAA — patient answers must never be reused across users |
+| `is_fallback == False` | Never cache a guardrail rejection |
+| `len(answer) ≥ 100` | Filters out clarification messages |
 
 ### Pinecone namespace strategy
 
 ```
-cache_pharma   → pharma agent (threshold=0.97, strict)
-cache_general  → general agent (threshold=0.88, relaxed)
-episodic__*    → episodic memory (separate from cache)
+clinical-agent index:
+  cache_pharma   → pharma agent answers  (threshold=0.97)
+  cache_general  → general agent answers (threshold=0.88)
+  episodic__*    → per-user episodic memory (separate from cache)
+
+clinical-trials-index:
+  clinical-trials → ingested clinical trial chunks (search_tool reads here)
 ```
 
-Namespaces are isolated so a pharma cached answer can never bleed into a general
-agent query, and vice versa.
+---
 
-### Middleware execution order — simple mental model
+## OutputGuardrail — 3-Layer Safety Check
 
-The stack list order is the **request order**. The response order is simply **reversed**.
+Runs on every agent response before it reaches the user. Cheapest check first.
 
 ```
-Request  →   Tracer → PII → ContentFilter → SemanticCache → ... → OutputGuardrail → Agent
-Response ←   Tracer ← PII ← ContentFilter ← SemanticCache ← ... ← OutputGuardrail ← Agent
+Layer 1 — regex (<1ms)
+  Catches obvious violations: dosage claims, direct treatment recommendations
+
+Layer 2 — faithfulness (gpt-4o-mini)
+  "Is this answer grounded in what was actually retrieved?"
+  Score 0.0–1.0. Below 0.85 → safe fallback.
+
+Layer 3 — contradiction (gpt-4o-mini)
+  "Does this answer contradict the retrieved context?"
+  Score 0.0–1.0. Below 0.50 → hard fail.
 ```
 
-Think of it like airport security — you pass through the same checkpoints going in
-and coming out, just in reverse.
+Only runs layers 2 and 3 when real tool results exist (`search_tool`, `graph_tool`).
+`ask_user_input` answers are excluded from grounding — user answers like "Pfizer BNT162b2"
+are not clinical evidence and would score 0.00.
 
-Your actual logs confirm this:
+A sentinel `if state.get("_cache_is_fallback"): return None` at the top of `after_agent`
+prevents the middleware from re-evaluating its own fallback messages (which would cause
+an infinite retry loop).
+
+---
+
+## Real Data Sources
+
+### search_tool → Pinecone `clinical-trials-index`
+
+Queries real clinical trial chunks ingested from source documents. Uses `text-embedding-3-small`
+embeddings (1536-dim, same model used at ingestion). Returns `text`, `breadcrumbs`, and
+similarity `score` per chunk.
+
+### graph_tool → Neo4j AuraDB
+
+Queries a live graph of 25 clinical trials ingested from ClinicalTrials.gov via
+`clinical_trials_loader.py`. The graph schema:
+
 ```
-# Request (top to bottom)
-[CONTENT_FILTER]  Passed
-[CACHE_MW]        MISS — proceeding to agent
-...agent runs...
-
-# Response (bottom to top — reverse)
-[OUTPUT_GUARD]    PASSED        ← runs first on response
-[ACTION_GUARD]    tool_calls=2  ← runs second
-[CACHE_MW]        storing...    ← runs third  ✅ guardrail scores already available
-[TRACER]          run_complete  ← runs last
+Trial ──TARGETS──────► Disease
+      ──USES──────────► Drug
+      ──SPONSORED_BY──► Sponsor
+      ──MANAGED_BY────► CRO
+      ──CONDUCTED_IN──► Country
+      ──LOCATED_AT────► Site ──IN_COUNTRY──► Country
+      ──MEASURES──────► Outcome
+      ──INCLUDES──────► PatientPopulation
+      ──ASSOCIATED_WITH► MeSHTerm
+      ──BELONGS_TO────► TrialCategory
 ```
 
-**The one thing students need to remember:**
-
-> On the response side, whatever is at the **bottom of the stack runs first**.
-
-This is why `SemanticCacheMiddlewareWithRules` works correctly at position 4.
-By the time it runs on the response side, `OutputGuardrail` (position 9) and
-`ActionGuardrail` (position 8) have already finished and written their scores
-into state. The cache can read `faithfulness` and `tool_count` and make the right decision.
-
-If SemanticCache were moved to position 9 (bottom), it would run first on the
-response side — before the guardrails — and those scores would not exist yet.
-
-### Future: pub/sub write path
-
-Currently the cache write runs in a **daemon thread** (fire-and-forget) — the
-response is returned to the user before the Pinecone upsert completes.
-
-Planned Phase 2: replace the daemon thread with **SNS → SQS → Lambda**. The agent
-publishes a cache-write event; a separate Lambda consumer calls `cache.store()`.
-Benefits: decoupled, retryable, dead-letter queue for failed writes, cache writer
-scales independently of the agent.
+Two-stage query: first searches by trial title/NCT ID, then falls back to searching by
+drug name, disease name, sponsor, or MeSH term.
 
 ---
 
 ## Run
 
 ```bash
-# Clinical trial agent (direct)
-APP_ENV=dev python clinical_trial_agent/run.py
-
 # Platform API
-APP_ENV=dev uvicorn vs_platform.main:app --host 0.0.0.0 --port 8000 --reload
+uvicorn vs_platform.main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
-**Call the API:**
+### Test the HITL flow
+
+**Step 1 — ambiguous query (should interrupt):**
 ```bash
 curl -X POST http://localhost:8000/api/v1/clinical-trial/chat \
-  -H "X-API-Key: <your-platform-api-key>" \
+  -H "X-API-Key: local-dev-key" \
   -H "Content-Type: application/json" \
-  -d '{"message": "What are Phase 3 results for metformin?", "thread_id": "t1", "domain": "pharma"}'
+  -d '{"message": "Show me the trial data", "thread_id": "test-1", "domain": "pharma"}'
+# Expected: interrupted=true with question + options
+```
+
+**Step 2 — resume with specific answer:**
+```bash
+curl -X POST http://localhost:8000/api/v1/clinical-trial/resume \
+  -H "X-API-Key: local-dev-key" \
+  -H "Content-Type: application/json" \
+  -d '{"thread_id": "test-1", "user_answer": "Pfizer BNT162b2 Phase 3", "domain": "pharma"}'
+# Expected: interrupted=false with clinical answer
+```
+
+**Step 3 — specific query (no HITL):**
+```bash
+curl -X POST http://localhost:8000/api/v1/clinical-trial/chat \
+  -H "X-API-Key: local-dev-key" \
+  -H "Content-Type: application/json" \
+  -d '{"message": "What are the Phase 3 efficacy results for Pfizer BNT162b2?", "thread_id": "test-2", "domain": "pharma"}'
+# Expected: interrupted=false, direct answer, no HITL
 ```
 
 ---
 
 ## Known Issues & Fixes
 
+**HITL: LLM calls `ask_user_input` multiple times without pausing**
+Caused by `@dynamic_prompt` middleware conflicting with `HumanInTheLoopMiddleware` (both use
+`wrap_model_call`). Fixed by removing `@dynamic_prompt` and passing `system_prompt=` directly
+to `create_agent()`. The prompt is now fetched from Bedrock at agent creation time.
+
+**OutputGuardrail infinite retry loop (`faithfulness=0.00` repeated)**
+Caused by the guardrail re-evaluating its own fallback message. Fixed by adding a sentinel
+`if state.get("_cache_is_fallback"): return None` at the top of `after_agent`.
+
+**Episodic memory never storing (`LLM tagged NO` on every response)**
+Caused by the `EPISODIC: YES/NO` tag instruction missing from the Bedrock prompt. Fixed by
+adding the EPISODIC TAGGING section to the prompt. Without it the LLM never appends the tag
+so `_parse_storage_decision()` always returns `False`.
+
+**`[BASE_MW] session_id missing` warning on every request**
+Caused by `_get_run_id()` trying `runtime.run_id` and `runtime.thread_id` which don't exist
+in LangChain 1.0 (`Runtime` only exposes `context`, `store`, `stream_writer`). Fixed by reading
+`runtime.context["session_id"]` which is set by the gateway via `context={"session_id": thread_id}`.
+
 **`@` in Postgres password breaks DSN parsing**
-Passwords with special characters (`@`, `#`, `%`) are URL-encoded automatically
-by `core/aws.py`. No action needed — just ensure the raw password is correct in Secrets Manager.
+Passwords with special characters are URL-encoded automatically by `core/aws.py`. No action needed.
 
 **`PostgresSaver` requires `autocommit=True`**
-`CREATE INDEX CONCURRENTLY` cannot run inside a transaction.
-`agent.py` connects with `psycopg.connect(conn_string, autocommit=True)` — already handled.
-
-**HITL: agent responds in text instead of calling `ask_user_input`**
-The Bedrock prompt must include the MANDATORY CLARIFICATION RULE (already in the prompt
-template above). If you have an older prompt without it, update using the file approach
-in step 2 and bump the SSM version.
+`CREATE INDEX CONCURRENTLY` cannot run inside a transaction. `agent.py` connects with
+`psycopg.connect(conn_string, autocommit=True)` — already handled.
 
 **Shell quoting errors (`dquote>` prompt) when passing JSON to AWS CLI**
-Always write JSON to a file and pass `file:///tmp/filename.json` to `--cli-input-json`
-or `--secret-string`. Never pass complex JSON inline on the command line.
+Always write JSON to a file and pass `file:///tmp/filename.json`. Never pass complex JSON inline.
 
 **DynamoDB traces not appearing after first request**
-DynamoDB TTL deletes are eventually consistent — items are removed within 48 h of
-`expires_at`, not instantly. If traces are missing immediately after the first request,
-check CloudWatch logs for `[AWS] Trace persisted` or `[TRACER] Background DynamoDB write failed`.
-The background write is fire-and-forget; errors are logged but never bubble up to the API response.
+DynamoDB TTL deletes are eventually consistent — items are removed within 48h of `expires_at`,
+not instantly. Check logs for `[AWS] Trace persisted` or `[TRACER] Background DynamoDB write failed`.
 
-**Cache HIT on every request — `_store_sync` never fires**
-This is expected when the cache is already warm from previous runs. `_store_sync` only
-fires on a MISS where the agent runs and produces a cacheable answer. To force a cold
-cache for testing, clear the Pinecone namespace:
+**`TavilySearchResults` deprecation warning**
+`TavilySearchResults` is deprecated in LangChain 0.3.25. Migrate to:
 ```python
-from pinecone import Pinecone
-pc = Pinecone(api_key="...")
-pc.Index("clinical-agent").delete(delete_all=True, namespace="cache_pharma")
+pip install -U langchain-tavily
+from langchain_tavily import TavilySearch
 ```
-
-**Cache storing ambiguous clarification answers**
-If `ask_user_input` was called but no HITL resume happened (e.g. in run.py),
-the short clarification text can appear as the "answer". The `len(answer) >= 100`
-guard filters these out — they are never written to the cache.
 
 ---
 
 ## PyCharm Setup
 
 - Mark `clinical_trial_agent/` and `vs-agent-core/` as **Sources Root**
-- Run config working directory: `.../vs-agentic-platform` (not `clinical_trial_agent/`)
+- Run config working directory: `.../vs-agentic-platform`
 - Uncheck **Add content/source roots to PYTHONPATH** in run config
 
-> `vs_platform/` is named with underscore to avoid shadowing Python's built-in
-> `platform` standard library module.
+> `vs_platform/` is named with underscore to avoid shadowing Python's built-in `platform` module.
 
 ---
 
@@ -555,6 +567,10 @@ langchain-core==1.2.22
 langchain==1.1.0
 langchain-openai==1.1.1
 langgraph==1.0.4
+langgraph-checkpoint==3.0.1
+langgraph-checkpoint-postgres==3.0.5
+langgraph-prebuilt==1.0.7
 psycopg==3.3.3          ← 3.2.x breaks on Python 3.13
 psycopg-binary==3.3.3
+neo4j                   ← required for graph_tool
 ```

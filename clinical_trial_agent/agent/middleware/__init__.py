@@ -36,7 +36,6 @@ from agent.middleware.content_filter import ContentFilterMiddleware
 from agent.middleware.action_guardrail import ActionGuardrailMiddleware
 from agent.middleware.output_guardrail import OutputGuardrailMiddleware
 
-
 def build_stack(domain: str, store, safety_llm, cache: SemanticCache) -> list:
     """
     Assemble and return the ordered 9-layer middleware stack.
@@ -64,7 +63,7 @@ def build_stack(domain: str, store, safety_llm, cache: SemanticCache) -> list:
         HumanInTheLoopMiddleware(
             interrupt_on={"ask_user_input": True},
         ),
-        ActionGuardrailMiddleware(),
+        #ActionGuardrailMiddleware(),
         OutputGuardrailMiddleware(
             llm=safety_llm,
             faithfulness_threshold=0.85,

@@ -100,9 +100,8 @@ class DomainPIIMiddleware(BaseAgentMiddleware):
 
         log.info(f"[DOMAIN_PII] Output redacted  '{original[:40]}' → '{cleaned[:40]}'")
 
-        #New message object — don't mutate in place
-        redacted_msg = last_msg.copy(update={"content": cleaned})  # Pydantic v1
-        # redacted_msg = last_msg.model_copy(update={"content": cleaned})  # Pydantic v2
+        # New message object — don't mutate in place (Pydantic v2)
+        redacted_msg = last_msg.model_copy(update={"content": cleaned})
 
         # Return updated state
         return {"messages": messages[:-1] + [redacted_msg]}

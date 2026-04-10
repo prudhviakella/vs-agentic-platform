@@ -1,6 +1,6 @@
 # VS Agentic Platform
 
-Multi-agent AI platform built for Vidya Sankalp — Applied GenAI Engineering.
+Multi-agent AI platform built for  Applied GenAI Engineering.
 
 ---
 

@@ -23,6 +23,7 @@ dependencies = [
     "langgraph==1.0.4",
     "langgraph-prebuilt==1.0.7",
     "langchain-community==0.4.1",
+    "langchain-tavily",
 
     # AWS
     "boto3",

@@ -52,7 +52,7 @@ def _secretsmanager() -> Any:
 @lru_cache(maxsize=None)
 def _bedrock() -> Any:
     import boto3
-    return boto3.client("bedrock-agent-runtime")
+    return boto3.client("bedrock-agent")
 
 
 @lru_cache(maxsize=None)

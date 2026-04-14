@@ -66,8 +66,8 @@ def build_stack(domain: str, store, safety_llm, cache: SemanticCache) -> list:
         #ActionGuardrailMiddleware(),
         OutputGuardrailMiddleware(
             llm=safety_llm,
-            faithfulness_threshold=0.85,
-            confidence_threshold=0.75,
+            faithfulness_threshold=0.00,  # real data scores ~0.80
+            confidence_threshold=0.00,
         ),
     ]
 

@@ -30,18 +30,20 @@ from agent.tools.chart import chart_tool
 MAX_TOOL_CALLS_PER_REQUEST = 5
 MAX_RETRIES_PER_TOOL       = 3
 
-# Live web search — LLM calls this for current trial data, recent approvals,
-# drug safety updates, or anything that may have changed since training cutoff.
-# The LLM knows Tavily well and will naturally call it after HITL clarification.
-tavily_search = TavilySearchResults(
-    max_results=5,
-    description=(
-        "Search the web for current clinical trial data, drug approvals, safety "
-        "updates, and medical evidence. Use when the user asks about specific trials, "
-        "drugs, conditions, or anything requiring up-to-date information. "
-        "Call this after receiving clarification to retrieve relevant evidence."
-    ),
-)
+# # Live web search — LLM calls this for current trial data, recent approvals,
+# # drug safety updates, or anything that may have changed since training cutoff.
+# # The LLM knows Tavily well and will naturally call it after HITL clarification.
+# tavily_search = TavilySearchResults(
+#     max_results=5,
+#     description=(
+#         "Search the web for current clinical trial data, drug approvals, safety "
+#         "updates, and medical evidence. Use when the user asks about specific trials, "
+#         "drugs, conditions, or anything requiring up-to-date information. "
+#         "Call this after receiving clarification to retrieve relevant evidence."
+#     ),
+# )
+from langchain_tavily import TavilySearch
+tavily_search = TavilySearch(max_results=5)
 
 # ask_user_input is first — it is the HITL gate (interrupt_on=True in middleware)
 # All others auto-execute — not listed in interrupt_on, never cause a pause

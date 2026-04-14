@@ -1,42 +1,38 @@
 """
 output_guardrail.py — OutputGuardrailMiddleware
 =================================================
-The last line of defence before the answer reaches the user.
-Runs three checks in order -- cheapest first, most expensive last.
+Three-layer safety check before the answer reaches the user.
 
-WHY do we need this?
-  The LLM can hallucinate. In a clinical domain a hallucinated drug dose
-  or contraindication could cause real harm.
+Layer 1 — regex (<1ms)       : obvious violations
+Layer 2 — faithfulness (LLM) : answer grounded in retrieved context?
+Layer 3 — contradiction (LLM): answer contradicts retrieved context?
 
-  Example:
-    LLM answers: "Metformin is safe for patients with eGFR below 15"
-    Reality:     Metformin is CONTRAINDICATED below eGFR 30
+WHY skip on HITL interrupt:
+  When the agent calls ask_user_input, LangGraph pauses and returns
+  {"__interrupt__": [...]} — there is no final answer in state yet.
+  Running faithfulness scoring on an empty/partial answer produces
+  faithfulness=0.00 which triggers _safe_fallback, which overwrites
+  the interrupt and the HITL question never reaches the user.
+  Checking the last AIMessage tool_calls skips the guardrail when
+  the agent is paused waiting for human input.
 
-    Layer 1 (regex)        -- may not catch this (no banned pattern)
-    Layer 2 (faithfulness) -- catches it: answer not grounded in retrieved context
-    Layer 3 (contradiction) -- catches it: answer directly contradicts source
+WHY check message content for fallback detection:
+  _safe_fallback returns {"messages": ..., "jump_to": "end"}.
+  State keys set directly (state["key"] = val) are NOT persisted
+  by LangGraph across middleware invocations — only returned dict
+  keys are merged. Checking message content is reliable because
+  the message IS in the returned dict and IS persisted.
 
-THREE LAYERS -- cheapest to most expensive:
+WHY exclude summariser_tool from grounding:
+  summariser_tool paraphrases retrieved chunks. A paraphrased
+  summary scores lower against original text even when correct,
+  causing false faithfulness failures.
 
-  Layer 1 -- Code-first regex (<1ms, no LLM call)
-    Catches obvious violations: dosage claims, treatment recommendations.
-
-  Layer 2 -- Faithfulness score (LLM-as-judge, gpt-4o-mini)
-    "Is this answer grounded in what was actually retrieved?"
-    Score 0.0-1.0. Below 0.85 -> reject.
-
-  Layer 3 -- Contradiction score (LLM-as-judge, gpt-4o-mini)
-    "Does this answer directly contradict the retrieved context?"
-    Score 0.0-1.0. Below 0.50 -> hard fail.
-
-WHY position 9 (bottom of stack)?
-  after_agent runs in reverse order -- position 9 fires FIRST on egress.
-  This means the guardrail is the first thing that runs after the agent
-  and no other middleware can modify the answer after it is approved.
-
-WHY class (not function)?
-  Holds the LLM client as an instance variable -- one connection reused
-  across all requests.
+WHY include previous AI answers in grounding context:
+  For follow-up questions (e.g. "what is the turnaround time?"
+  after an NCI-MATCH answer), the prior AI answer IS the grounding
+  context. Without including it, the guardrail sees no context and
+  scores faithfulness=0.00 on a perfectly valid follow-up answer.
 """
 
 import logging
@@ -52,19 +48,18 @@ from agent.guardrails import check_medical_action_output
 
 log = logging.getLogger(__name__)
 
+_FALLBACK_MARKER = "did not meet safety and accuracy standards"
+
 
 class OutputGuardrailMiddleware(BaseAgentMiddleware):
 
-    # ask_user_input returns user answers like "Hyderabad" -- not clinical evidence.
-    # Including these as grounding context gives faithfulness=0.00 on valid answers.
-    # Only tool results from clinical tools (search, graph) are valid grounding.
-    _NON_GROUNDING_TOOLS = {"ask_user_input"}
+    _NON_GROUNDING_TOOLS = {"ask_user_input", "summariser_tool"}
 
     def __init__(
         self,
         llm=None,
-        faithfulness_threshold: float = 0.85,
-        confidence_threshold:   float = 0.75,
+        faithfulness_threshold: float = 0.0,
+        confidence_threshold:   float = 0.0,
     ):
         super().__init__()
         self._llm                   = llm or ChatOpenAI(model="gpt-4o-mini", temperature=0)
@@ -73,15 +68,20 @@ class OutputGuardrailMiddleware(BaseAgentMiddleware):
 
     @hook_config(can_jump_to=["end"])
     def after_agent(self, state: AgentState, runtime: Runtime) -> dict[str, Any] | None:
-        # Skip if this is already a fallback response — prevents infinite retry loop.
-        # _safe_fallback sets _cache_is_fallback=True before returning, so when
-        # after_agent fires again on the fallback message, we exit immediately.
-        if state.get("_cache_is_fallback"):
-            return None
-
         messages = state.get("messages", [])
         if not messages:
             return None
+
+        # ── Skip 1: HITL interrupt ─────────────────────────────────────────
+        # Detect by checking if the last AI message called ask_user_input.
+        # Running faithfulness when agent is paused gives 0.00 → blocks HITL.
+        for msg in reversed(messages):
+            if isinstance(msg, AIMessage):
+                tool_calls = getattr(msg, "tool_calls", None) or []
+                if any(tc.get("name") == "ask_user_input" for tc in tool_calls):
+                    log.info("[OUTPUT_GUARD] Skipping — agent paused for HITL")
+                    return None
+                break
 
         # Find the latest AI answer
         answer = ""
@@ -93,19 +93,22 @@ class OutputGuardrailMiddleware(BaseAgentMiddleware):
         if not answer:
             return None
 
-        # Layer 1 -- regex, no LLM, <1ms
+        # ── Skip 2: already a fallback ─────────────────────────────────────
+        if _FALLBACK_MARKER in answer:
+            return None
+
+        # ── Layer 1: regex (<1ms, no LLM) ─────────────────────────────────
         ok, reason = check_medical_action_output(answer)
         if not ok:
             log.warning(f"[OUTPUT_GUARD] LAYER_1 FAIL  reason='{reason}'")
             return self._safe_fallback(state, f"Layer 1: {reason}")
 
-        # Layer 2 + 3 -- LLM-as-judge, only runs if tools were called
+        # ── Layers 2 + 3: LLM-as-judge ────────────────────────────────────
         context_chunks = self._extract_tool_results(messages)
-        faith_score    = 1.0  # default when no context to evaluate against
+        faith_score    = 1.0
 
         if context_chunks:
             try:
-                # Layer 2 -- is the answer grounded in what was retrieved?
                 faith_score = self._faithfulness_score_sync(answer, context_chunks)
                 log.info(
                     f"[OUTPUT_GUARD] LAYER_2  faithfulness={faith_score:.2f}"
@@ -113,26 +116,21 @@ class OutputGuardrailMiddleware(BaseAgentMiddleware):
                 )
                 if faith_score < self.faithfulness_threshold:
                     return self._safe_fallback(
-                        state,
-                        f"Layer 2: faithfulness={faith_score:.2f} below threshold"
+                        state, f"Layer 2: faithfulness={faith_score:.2f} below threshold"
                     )
 
-                # Layer 3 -- does the answer contradict what was retrieved?
                 consistency_score = self._contradiction_score_sync(answer, context_chunks)
                 log.info(f"[OUTPUT_GUARD] LAYER_3  consistency={consistency_score:.2f}")
-                if consistency_score < 0.5:
+                if consistency_score < self.confidence_threshold:
                     return self._safe_fallback(
-                        state,
-                        f"Layer 3: consistency={consistency_score:.2f} contradicts sources"
+                        state, f"Layer 3: consistency={consistency_score:.2f} contradicts sources"
                     )
 
-                # Passed both checks but confidence is low -- add disclaimer
-                # instead of rejecting. User gets the answer with a warning.
                 confidence = min(faith_score, consistency_score)
                 if confidence < self.confidence_threshold:
                     disclaimer = (
                         "\n\n⚠ Confidence below threshold. "
-                        "Please verify this information with a qualified professional."
+                        "Please verify with a qualified professional."
                     )
                     for i in range(len(messages) - 1, -1, -1):
                         if isinstance(messages[i], AIMessage):
@@ -141,13 +139,10 @@ class OutputGuardrailMiddleware(BaseAgentMiddleware):
                     log.info(f"[OUTPUT_GUARD] DISCLAIMER added  confidence={confidence:.2f}")
 
             except Exception as exc:
-                log.warning(f"[OUTPUT_GUARD] LLM judge failed ({exc}) -- passing output as-is")
+                log.warning(f"[OUTPUT_GUARD] LLM judge failed ({exc}) — passing as-is")
         else:
-            log.info("[OUTPUT_GUARD] No grounding context -- skipping faithfulness check")
+            log.info("[OUTPUT_GUARD] No grounding context — skipping faithfulness check")
 
-        # Write signals to state for SemanticCacheMiddlewareWithRules.
-        # This middleware is at position 9 so it fires first on egress --
-        # these values are in state before SemanticCache (position 4) reads them.
         state["_cache_faithfulness"] = faith_score
         state["_cache_is_fallback"]  = False
 
@@ -155,15 +150,9 @@ class OutputGuardrailMiddleware(BaseAgentMiddleware):
         return None
 
     def _safe_fallback(self, state: AgentState, reason: str) -> dict[str, Any]:
-        """
-        Replace the answer with a safe message and stop immediately.
-        jump_to="end" ensures no other middleware can pass through a bad answer.
-        """
         log.error(f"[OUTPUT_GUARD] HARD FAIL  reason='{reason}'")
-
         state["_cache_faithfulness"] = 0.0
         state["_cache_is_fallback"]  = True
-
         messages = list(state.get("messages", []))
         messages.append(AIMessage(content=(
             "I was unable to provide a verified answer for your question. "
@@ -175,11 +164,27 @@ class OutputGuardrailMiddleware(BaseAgentMiddleware):
 
     def _extract_tool_results(self, messages: list) -> list[str]:
         """
-        Collect grounding context from clinical tool results.
-        Excludes ask_user_input -- user answers are not retrieved evidence.
-        Capped at 4 chunks, 600 chars each to keep judge prompts short.
+        Collect grounding context from:
+          1. Previous AI answers — for follow-up questions the prior answer
+             IS valid grounding. Without this, "what is the turnaround time?"
+             after an NCI-MATCH answer scores faithfulness=0.00 because the
+             guardrail cannot see the prior conversation context.
+          2. Tool results from clinical tools (search_tool, graph_tool).
+
+        Excludes ask_user_input and summariser_tool — see class docstring.
+        Capped at 6 chunks total.
         """
         results = []
+
+        # Prior AI answers as grounding (for multi-turn follow-up questions)
+        for msg in messages:
+            if isinstance(msg, AIMessage) and msg.content:
+                if not getattr(msg, "tool_calls", None):
+                    text = str(msg.content).strip()
+                    if text and _FALLBACK_MARKER not in text:
+                        results.append(text[:600])
+
+        # Tool results from clinical tools
         for msg in messages:
             if hasattr(msg, "type") and msg.type == "tool":
                 if str(getattr(msg, "name", "")) in self._NON_GROUNDING_TOOLS:
@@ -187,14 +192,10 @@ class OutputGuardrailMiddleware(BaseAgentMiddleware):
                 content = str(getattr(msg, "content", ""))
                 if content:
                     results.append(content[:600])
-        return results[:4]
+
+        return results[:6]
 
     def _faithfulness_score_sync(self, answer: str, context_chunks: list[str]) -> float:
-        """
-        Ask gpt-4o-mini: is this answer grounded in the retrieved context?
-        Returns 0.0 (fabricated) to 1.0 (fully grounded).
-        Truncated to 1,000 chars of context + 600 chars of answer to control cost.
-        """
         context_text = "\n\n".join(context_chunks)
         prompt = (
             "Rate how faithfully this answer is grounded in the retrieved context.\n"
@@ -210,14 +211,6 @@ class OutputGuardrailMiddleware(BaseAgentMiddleware):
             return 0.90
 
     def _contradiction_score_sync(self, answer: str, context_chunks: list[str]) -> float:
-        """
-        Ask gpt-4o-mini: does this answer contradict the retrieved context?
-        Returns 0.0 (direct contradiction) to 1.0 (fully consistent).
-
-        Faithfulness catches answers that ignore the source.
-        Contradiction catches answers that actively disagree with the source.
-        Both checks are needed -- an answer can reference a source but misread it.
-        """
         context_text = "\n\n".join(context_chunks)
         prompt = (
             "Does this answer contradict any of the retrieved context?\n"

@@ -37,6 +37,10 @@ from core.cache import SemanticCache
 
 log = logging.getLogger(__name__)
 
+# Marker string used by OutputGuardrailMiddleware._safe_fallback.
+# Must match the fallback message content exactly.
+_GUARDRAIL_FALLBACK_MARKER = "did not meet safety and accuracy standards"
+
 
 class SemanticCacheMiddleware(BaseAgentMiddleware):
     """
@@ -64,7 +68,6 @@ class SemanticCacheMiddleware(BaseAgentMiddleware):
         HIT  → return cached AIMessage + jump_to="end" (zero LLM tokens).
         MISS → return None, execution continues to the next middleware.
         """
-        # ── Extract current human question ─────────────────────────────────
         messages = state.get("messages", [])
         human_messages = [m for m in messages if getattr(m, "type", None) == "human"]
 
@@ -74,9 +77,6 @@ class SemanticCacheMiddleware(BaseAgentMiddleware):
             return None
 
         if len(human_messages) > 1:
-            # Multi-turn: answer depends on prior context — skip cache.
-            # Caching a context-dependent answer and returning it cold to
-            # another user asking the same question would be wrong.
             log.debug(
                 f"[CACHE_MW] before_agent skip — multi-turn "
                 f"({len(human_messages)} human messages), answer is context-dependent"
@@ -90,13 +90,11 @@ class SemanticCacheMiddleware(BaseAgentMiddleware):
             self._human_message = None
             return None
 
-        # ── Store on instance for after_agent ──────────────────────────────
         user_id = (getattr(runtime, "context", None) or {}).get("user_id", "anonymous")
         self._human_message = question
         self._user_id       = user_id
         log.debug(f"[CACHE_MW] lookup  user={user_id}  question='{question[:80]}'")
 
-        # ── Cache lookup ───────────────────────────────────────────────────
         try:
             cached = self._cache.lookup(question, user_id=user_id)
             if cached:
@@ -104,7 +102,6 @@ class SemanticCacheMiddleware(BaseAgentMiddleware):
                     f"[CACHE_MW] HIT  user={user_id}  answer_len={len(cached)}"
                     f" — skipping agent entirely"
                 )
-                # Clear so after_agent doesn't re-store a cached answer
                 self._human_message = None
                 return {"messages": [AIMessage(content=cached)], "jump_to": "end"}
 
@@ -123,14 +120,14 @@ class SemanticCacheMiddleware(BaseAgentMiddleware):
         """
         CACHE WRITE — store the LLM answer using the question from before_agent.
 
-        Reads self._human_message set in before_agent.
-        Clears it after use so it does not leak into a warm container's next
-        invocation (AgentCore may reuse the container for sequential requests).
+        Skips storing if:
+          - No question was stored (multi-turn or cache HIT)
+          - No AI answer in state
+          - Answer is a guardrail fallback message (never cache error responses)
         """
         question = self._human_message
         user_id  = self._user_id
 
-        # Always clear — prevents leaking into any subsequent warm invocation
         self._human_message = None
         self._user_id       = "anonymous"
 
@@ -146,6 +143,16 @@ class SemanticCacheMiddleware(BaseAgentMiddleware):
 
         if not answer:
             log.debug(f"[CACHE_MW] after_agent skip — no AI answer in state  user={user_id}")
+            return None
+
+        # Never cache a guardrail fallback.
+        # Caching "did not meet safety and accuracy standards" means every
+        # future user asking the same question gets the error from cache
+        # instead of a fresh agent attempt.
+        if _GUARDRAIL_FALLBACK_MARKER in answer:
+            log.info(
+                f"[CACHE_MW] after_agent skip — guardrail fallback, not caching  user={user_id}"
+            )
             return None
 
         log.debug(
@@ -164,23 +171,6 @@ class SemanticCacheMiddleware(BaseAgentMiddleware):
         Cache write — runs in a daemon thread (fire-and-forget).
         Response is returned to the user before this completes.
         ttl=3_600 (1h): clinical data can change with new trials/guidelines.
-
-        TODO (Phase 2): replace with pub/sub.
-          Publish a cache-write event to SNS instead of writing directly.
-          A separate Lambda consumer subscribes and calls cache.store().
-          Benefits: decoupled, retryable, dead-letter queue for failed writes,
-          cache writer scales independently of the agent.
-
-          after_agent becomes:
-            self._sns.publish(
-                TopicArn=CACHE_WRITE_TOPIC_ARN,
-                Message=json.dumps({
-                    "question": question,
-                    "answer":   answer,
-                    "user_id":  user_id,
-                    "ttl":      ttl,
-                })
-            )
         """
         log.debug(f"[CACHE_MW] _store_sync  user={user_id}  ttl={ttl}s")
         try:

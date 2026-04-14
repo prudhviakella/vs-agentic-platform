@@ -10,18 +10,25 @@ How it works:
   LLM calls ask_user_input(question, options) → middleware intercepts →
   graph PAUSES → human answers → Command(resume=edit+user_answer) →
   tool runs → returns user_answer as ToolMessage → LLM continues
+
+WHY question and options are Optional:
+  On resume, LangChain invokes the tool with ONLY user_answer injected.
+  The original question/options are already in the message history from the
+  first call — passing them again would duplicate them. Making them optional
+  prevents a Pydantic validation error on resume:
+    "question: Field required / options: Field required"
 """
 
-from typing import List
+from typing import List, Optional
 from langchain_core.tools import tool
 
 
 @tool(parse_docstring=True)
 def ask_user_input(
-    question: str,
-    options: List[str],
-    allow_freetext: bool = True,
     user_answer: str = "",
+    question: Optional[str] = None,
+    options: Optional[List[str]] = None,
+    allow_freetext: bool = True,
 ) -> str:
     """
     Ask the user a clarifying question when the request is genuinely ambiguous.
@@ -29,17 +36,16 @@ def ask_user_input(
     Only call this when a critical piece of information is completely missing
     and cannot be inferred from the conversation. If the user has already
     provided any context or answered a previous question, do NOT call this
-    again — use that context to call tavily_search or search_tool instead.
+    again — use that context to call search_tool instead.
 
     Ask ONE question at a time. Generate options that are specific to the
     user's exact request — never use generic placeholders like 'Option A'.
 
     Args:
+        user_answer:    Leave empty when calling. The human's answer is injected here on resume.
         question:       The specific clarifying question to ask the user.
-        options:        Contextually relevant choices derived from the user's
-                        actual request context.
+        options:        Contextually relevant choices derived from the user's actual request.
         allow_freetext: Whether the user can type a custom answer beyond the options.
-        user_answer:    Leave empty. The human's answer is injected here on resume.
 
     Returns:
         The human's answer as a string. Use this to search and complete the task.

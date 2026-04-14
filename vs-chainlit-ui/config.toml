@@ -1,0 +1,24 @@
+[project]
+enable_telemetry = false
+session_timeout = 3600
+
+[features]
+prompt_playground = false
+multi_modal = false
+
+[UI]
+name = "Clinical Trial Research Assistant"
+description = "AI-powered clinical trial knowledge base"
+default_expand_messages = true
+
+[UI.theme]
+default = "dark"
+
+[UI.theme.dark]
+background = "#0f1117"
+paper = "#1a1d2e"
+
+[UI.theme.dark.primary]
+main = "#4f9cf9"
+dark = "#2563eb"
+light = "#93c5fd"

@@ -20,7 +20,7 @@ import httpx
 import chainlit as cl
 
 # ── Config ──────────────────────────────────────────────────────────────────
-API_URL = os.environ.get("AGENT_API_URL", "http://localhost:8000")
+API_URL = os.environ.get("AGENT_API_URL", "http://localhost:8001")
 API_KEY = os.environ.get("AGENT_API_KEY", "local-dev-key")
 DOMAIN  = os.environ.get("AGENT_DOMAIN",  "pharma")
 AGENT   = "clinical-trial"

@@ -27,16 +27,20 @@ pip install --no-cache-dir -r requirements-dev.txt
 pip install neo4j  # graph_tool dependency
 
 # 3. Export environment variables
-export OPENAI_API_KEY="sk-..."
-export PINECONE_API_KEY="pcsk-..."
-export PINECONE_INDEX_NAME="clinical-agent"
-export CLINICAL_TRIALS_INDEX="clinical-trials-index"
-export NEO4J_URI="neo4j+s://52c31090.databases.neo4j.io"
-export NEO4J_USER="52c31090"
-export NEO4J_PASSWORD="your-neo4j-password"
-export TAVILY_API_KEY="tvly-..."
-export POSTGRES_URL="postgresql://user:pass@localhost:5432/clinical_agent"
+export OPENAI_API_KEY=sk-...
+export PINECONE_API_KEY=pcsk-...
+export PINECONE_INDEX_NAME=clinical-agent
+export CLINICAL_TRIALS_INDEX=clinical-trials-index
+export NEO4J_URI=neo4j+s://52c31090.databases.neo4j.io
+export NEO4J_USER=52c31090
+export NEO4J_PASSWORD=your-neo4j-password
+export TAVILY_API_KEY=tvly-...
+export POSTGRES_URL=postgresql://user:pass@localhost:5432/clinical_agent
 export PLATFORM_API_KEY="local-dev-key"
+export APP_ENV=local
+export LANGSMITH_API_KEY=lsv2_......
+export LANGSMITH_PROJECT=langchain-agent-experiments
+export LANGSMITH_TRACING=true
 ```
 
 ---
